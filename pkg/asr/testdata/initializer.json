@@ -1,0 +1,23 @@
+[
+    {
+        "httpRequest": {
+            "method": "POST",
+            "path": "/transcribe"
+        },
+        "httpResponse": {
+            "statusCode": 200,
+            "headers": {
+                "Content-Type": [
+                    "application/json"
+                ]
+            },
+            "body": {
+                "transcription": "Rescue Trail, TAC 8, Battalion 181, Engine 146, 8, 146, 1, NFD 9031, Road, Rescue Trail, TAC 8, Battalion 181, Engine 146, 8, 146, 1, NFD 9031, Road, 2001 Hours.",
+                "filename": "demo.wav"
+            }
+        },
+        "times": {
+            "unlimited": true
+        }
+    }
+]

@@ -102,7 +102,7 @@ services:
     environment:
       - MOCKSERVER_WATCH_INITIALIZATION_JSON=true
       - MOCKSERVER_PROPERTY_FILE=/config/mockserver.properties
-      - MOCKSERVER_INITIALIZATION_JSON_PATH=/config/initializerJson.json
+      - MOCKSERVER_INITIALIZATION_JSON_PATH=/config/initializer.json
     volumes:
       - ./docker/mock-asr:/config
     command: -logLevel INFO -serverPort 1080
