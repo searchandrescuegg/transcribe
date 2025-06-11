@@ -1,0 +1,20 @@
+[
+  {
+    "httpRequest": {
+      "method": "POST",
+      "path": "/transcribe"
+    },
+    "httpResponse": {
+      "statusCode": 200,
+      "headers": {
+        "Content-Type": [
+          "application/json"
+        ]
+      },
+      "bodyFromFile": "/testdata/emergency_response.json"
+    },
+    "times": {
+      "unlimited": true
+    }
+  }
+]

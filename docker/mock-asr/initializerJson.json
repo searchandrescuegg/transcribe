@@ -1,0 +1,21 @@
+[
+  {
+    "httpRequest": {
+      "method": "POST",
+      "path": "/transcribe"
+    },
+    "httpResponse": {
+      "statusCode": 200,
+      "headers": {
+        "Content-Type": ["application/json"]
+      },
+      "body": {
+        "transcription": "Dispatch, this is Unit 47. We have a hiker reported missing on the North Ridge Trail near mile marker 3.2. Last seen wearing a red jacket and blue backpack. Requesting search and rescue response and medical standby. Visibility is poor due to fog conditions. Please advise ETA on SAR teams. Unit 47 establishing command post at trailhead parking area.",
+        "filename": "emergency_call_001.wav"
+      }
+    },
+    "times": {
+      "unlimited": true
+    }
+  }
+]
