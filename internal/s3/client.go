@@ -7,6 +7,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
@@ -15,47 +16,24 @@ type S3Client struct {
 	bucket string
 }
 
-func NewS3Client(region, endpoint, bucket string, isLocal bool) (*S3Client, error) {
-	var cfg aws.Config
-	var err error
-
-	if isLocal {
-		cfg, err = config.LoadDefaultConfig(context.TODO(),
-			config.WithRegion(region),
-			config.WithEndpointResolverWithOptions(aws.EndpointResolverWithOptionsFunc(
-				func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-					return aws.Endpoint{
-						PartitionID:   "aws",
-						URL:           endpoint,
-						SigningRegion: region,
-					}, nil
-				})),
-		)
-	} else {
-		cfg, err = config.LoadDefaultConfig(context.TODO(),
-			config.WithRegion(region),
-		)
-	}
-
+func NewS3Client(accessKey string, secretKey string, endpoint string, region string, bucket string) (*S3Client, error) {
+	cfg, err := config.LoadDefaultConfig(context.TODO(),
+		config.WithRegion(region),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")),
+	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load AWS config: %w", err)
+		return nil, err
 	}
 
-	var client *s3.Client
-	if isLocal {
-		client = s3.NewFromConfig(cfg, func(o *s3.Options) {
-			o.UsePathStyle = true
-		})
-	} else {
-		client = s3.NewFromConfig(cfg)
-	}
+	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.BaseEndpoint = aws.String(endpoint)
+		o.UsePathStyle = true
+	})
 
-	s3Client := &S3Client{
+	return &S3Client{
 		client: client,
 		bucket: bucket,
-	}
-
-	return s3Client, nil
+	}, nil
 }
 
 func (c *S3Client) GetFile(ctx context.Context, key string) (io.ReadCloser, error) {

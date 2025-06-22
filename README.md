@@ -15,47 +15,96 @@
 
 ---
 ## Overview
-`transcribe` is a distributed Go service designed for high-throughput audio transcription processing. It integrates Apache Pulsar for message queuing, S3-compatible storage for audio file management, and external ASR services for speech-to-text conversion. The service is built with observability in mind, featuring comprehensive metrics, tracing, and logging capabilities.
+`transcribe` is a radio communication monitoring service that provides early notifications and short reports of trail rescue operations. It automatically transcribes radio communications from NORCOM Fire Department channels and uses AI analysis to identify trail rescue activities.
 
-The service follows a worker-pool architecture where multiple concurrent workers consume file processing messages from Pulsar, download audio files from S3, send them to an ASR endpoint for transcription, and publish the results back to Pulsar for downstream processing.
+The service processes audio files from fire dispatch channels, intelligently detects when trail rescue operations begin, and provides timely notifications via Slack.
 
 ### Key Features
 
-1. **Scalable Worker Architecture**  
-   Configurable worker pool size allows horizontal scaling to handle varying transcription workloads. Each worker operates independently, ensuring fault isolation and optimal resource utilization.
+1. **Intelligent Radio Monitoring**  
+   Automatically processes WAV audio files from NORCOM Fire Department channels, filtering for relevant talkgroups and identifying trail rescue operations through AI-powered transcript analysis.
 
-2. **Reliable Message Processing**  
-   Apache Pulsar integration provides guaranteed message delivery, partitioned topics for load distribution, and subscription-based consumption patterns that ensure no audio files are lost during processing.
+2. **Dynamic Channel Activation**  
+   When trail rescues are detected on Fire Dispatch channels, the system automatically enables monitoring of assigned tactical channels (TAC1-TAC10) for the duration of the operation.
 
-3. **Cloud-Native Storage**  
-   S3-compatible storage support (including AWS S3, MinIO, and other S3-compatible services) enables secure, scalable audio file storage with proper access controls and regional distribution.
+3. **Early Notification System**  
+   Provides timely Slack notifications with call details, transcripts, and live audio links from OpenMHz.com.
 
-4. **Comprehensive Observability**  
-   Built-in OpenTelemetry integration provides distributed tracing, Prometheus metrics collection, and structured JSON logging for complete visibility into service performance and health.
+4. **Scalable Processing Architecture**  
+   Configurable worker pool processes multiple audio files concurrently using Apache Pulsar for reliable message queuing and S3 for audio file storage.
 
-5. **Flexible ASR Integration**  
-   RESTful API design allows integration with any ASR service that accepts multipart file uploads, making it compatible with popular services like AWS Transcribe, Google Speech-to-Text, or custom ASR endpoints.
+5. **Comprehensive Integration**  
+   Combines ASR transcription, Ollama AI analysis, Redis caching for channel management, and Slack messaging in a unified monitoring pipeline with full observability.
+
+<details>
+<summary><strong>System Flow</strong></summary>
+
+```mermaid
+flowchart TD
+    A[Radio Audio Files] --> B[S3 Bucket]
+    B --> C[S3 Event Notification]
+    C --> D[Apache Pulsar Queue]
+    D --> E[Transcribe Workers]
+    
+    E --> F{File Filter<br/>WAV + Known Talkgroup?}
+    F -->|Yes| G[Download & Transcribe Audio]
+    F -->|No| Z[Skip Processing]
+    
+    G --> H[ASR Service]
+    H --> I[Transcript Generated]
+    
+    I --> J{Fire Dispatch<br/>Channel?}
+    J -->|Yes| K[Ollama AI Analysis]
+    J -->|No| R{TAC Channel<br/>Active?}
+    
+    K --> M{Trail Rescue<br/>Detected?}
+    M -->|Yes| N[Extract TAC Channel Info]
+    M -->|No| L[Log & Store]
+    
+    N --> O[Store Thread ID in Dragonfly]
+    O --> P[Send Initial Slack Alert]
+    P --> Q[Include Call Details & OpenMHz Link]
+    
+    R -->|Yes| S[Get Thread ID from Dragonfly]
+    R -->|No| L
+    S --> T[Post to Slack Thread]
+    
+    Q --> U[Set TTL Timer]
+    U --> V[Monitor TAC Channel]
+    V --> W[Auto-Send Channel Closed Message]
+    
+    T --> L
+    W --> X[Expires from Dragonfly]
+    Q --> L
+    
+    style A fill:#e1f5fe
+    style P fill:#c8e6c9
+    style K fill:#fff3e0
+    style O fill:#f3e5f5
+    style T fill:#e8f5e8
+    style W fill:#fff8dc
+```
+
+</details>
 
 ### Architecture Benefits
 
-Using this distributed architecture provides several advantages:
+This monitoring system provides several operational advantages:
 
-1. **High Availability**  
-   Multiple workers and message queuing ensure the service continues processing even if individual components fail. Pulsar's built-in replication and persistence guarantee message durability.
+1. **Early Awareness**  
+   Detects trail rescue operations as soon as they're dispatched.
 
-2. **Elastic Scaling**  
-   Worker count can be adjusted based on processing demand. The service scales horizontally by adding more instances, and vertically by increasing worker count per instance.
+2. **Automated Channel Management**  
+   Dynamically enables tactical channel monitoring based on dispatch assignments, reducing manual coordination overhead.
 
-3. **Fault Tolerance**  
-   Failed transcription attempts are logged but don't block other processing. The message queue ensures failed messages can be retried or handled by dead letter queues.
+3. **Reliable Processing**  
+   Message queuing and worker pools ensure continuous monitoring even during high radio traffic periods or component failures.
 
-4. **Monitoring & Debugging**  
-   Structured logging, distributed tracing, and comprehensive metrics enable rapid identification of bottlenecks, errors, and performance issues in production environments.
+4. **Contextual Notifications**  
+   Slack integration provides rich context including transcripts, call types, and direct links to live audio streams for immediate situational awareness.
 
-5. **Storage Flexibility**  
-   S3-compatible storage abstraction allows deployment across different cloud providers or on-premises environments without code changes.
-
-By utilizing this service, organizations can build robust audio processing pipelines that scale from hundreds to millions of audio files while maintaining reliability and observability.
+5. **Observability & Maintenance**  
+   Comprehensive logging, metrics, and tracing enable monitoring of system health and rapid troubleshooting of processing issues.
 
 ## Development
 
@@ -77,9 +126,11 @@ By utilizing this service, organizations can build robust audio processing pipel
 
 This service includes a complete local development environment using Docker Compose with the following components:
 
-- **Apache Pulsar**: Message broker for file processing queues
-- **S3 Ninja**: S3-compatible storage for audio files  
-- **Mock ASR**: Simulated ASR service for testing
+- **Apache Pulsar**: Message broker for S3 events and processing queues
+- **S3 Ninja**: S3-compatible storage for radio audio files  
+- **Mock ASR**: Simulated transcription service for testing
+- **Ollama**: AI service running Llama 3.1 8B for dispatch analysis
+- **Dragonfly**: Redis-compatible cache for tactical channel management
 - **Grafana LGTM**: Observability stack (Logs, Grafana, Tempo, Mimir)
 
 To start the development environment:
@@ -107,42 +158,44 @@ The service exposes the following ports:
 The service is configured via environment variables. Key settings include:
 
 ```bash
-# Logging
-LOG_LEVEL=info
-
-# Pulsar Configuration
+# Core Services
 PULSAR_URL=pulsar://localhost:6650
 PULSAR_INPUT_TOPIC=public/transcribe/file-queue
-PULSAR_OUTPUT_TOPIC=public/transcribe/transcription-results
 PULSAR_SUBSCRIPTION=transcribe-consumer
-
-# S3 Configuration
-S3_REGION=us-east-1
-S3_BUCKET=audio
 S3_ENDPOINT=http://localhost:9444
+S3_BUCKET=audio
+DRAGONFLY_ADDRESS=localhost:6379
 
-# ASR Configuration
-TARGET_ENDPOINT=http://localhost:1080/transcribe
+# AI & Analysis
+ASR_ENDPOINT=http://localhost:8080/asr
+OLLAMA_PROTOCOL=http
+OLLAMA_HOST=localhost:11434
 
-# Worker Configuration
+# Notifications
+SLACK_TOKEN=xoxb-your-bot-token
+SLACK_CHANNEL_ID=C1234567890
+
+# Operational
 WORKER_COUNT=5
+LOG_LEVEL=info
+METRICS_ENABLED=true
 ```
 
 ### Testing
 
-To test the transcription pipeline:
+To test the radio monitoring pipeline:
 
 ```bash
-# Push a test audio file to the processing queue
+# Push a test audio file simulating a fire dispatch call
 make push-message
 
-# Monitor processing in the logs
+# Monitor processing and AI analysis in the logs  
 docker-compose logs -f main
 
 # Check Grafana dashboards at http://localhost:3000
 ```
 
-The test script pushes `demo.m4a` to the S3 bucket and publishes a processing message to Pulsar. You can monitor the complete pipeline from file upload through transcription to result publication.
+The test script uploads `demo.m4a` as a simulated fire dispatch audio file and triggers the complete pipeline: transcription, AI analysis for trail rescue detection, and Slack notification (if configured). Monitor the logs to see the transcript analysis and any tactical channel activations.
 
 <!--
 

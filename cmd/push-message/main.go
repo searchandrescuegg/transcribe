@@ -4,8 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
-	"fmt"
-	"log"
+	"log/slog"
 	"os"
 
 	"github.com/apache/pulsar-client-go/pulsar"
@@ -24,8 +23,8 @@ func main() {
 	flag.Parse()
 
 	if *message == "" {
-		fmt.Println("Usage: go run main.go -message <message> [-url <pulsar-url>] [-topic <topic>]")
-		fmt.Println("Example: go run main.go -message 'audio_file.wav'")
+		slog.Info("Usage: go run main.go -message <message> [-url <pulsar-url>] [-topic <topic>]")
+		slog.Info("Example: go run main.go -message 'audio_file.wav'")
 		os.Exit(1)
 	}
 
@@ -34,7 +33,8 @@ func main() {
 		URL: *pulsarURL,
 	})
 	if err != nil {
-		log.Fatalf("Failed to create Pulsar client: %v", err)
+		slog.Error("failed to create Pulsar client", slog.String("error", err.Error()))
+		os.Exit(1)
 	}
 	defer client.Close()
 
@@ -43,7 +43,8 @@ func main() {
 		Topic: *topic,
 	})
 	if err != nil {
-		log.Fatalf("Failed to create producer: %v", err)
+		slog.Error("failed to create producer", slog.String("error", err.Error()))
+		os.Exit(1)
 	}
 	defer producer.Close()
 
@@ -51,10 +52,11 @@ func main() {
 	msg := FileMessage{
 		File: *message,
 	}
-	
+
 	jsonPayload, err := json.Marshal(msg)
 	if err != nil {
-		log.Fatalf("Failed to marshal JSON: %v", err)
+		slog.Error("failed to marshal JSON", slog.String("error", err.Error()))
+		os.Exit(1)
 	}
 
 	// Send message
@@ -63,8 +65,9 @@ func main() {
 		Payload: jsonPayload,
 	})
 	if err != nil {
-		log.Fatalf("Failed to send message: %v", err)
+		slog.Error("failed to send message", slog.String("error", err.Error()))
+		os.Exit(1)
 	}
 
-	fmt.Printf("Successfully sent JSON message: %s\n", string(jsonPayload))
+	slog.Info("successfully sent JSON message", slog.String("payload", string(jsonPayload)))
 }
