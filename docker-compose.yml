@@ -1,3 +1,4 @@
+# yamllint disable rule:line-length
 ---
 services:
   main:
@@ -72,16 +73,16 @@ services:
         set -e
         echo 'Waiting for Pulsar to be ready...'
         sleep 10
-        
+
         echo 'Creating namespace...'
         bin/pulsar-admin --admin-url=http://pulsar:8080 namespaces create public/transcribe || echo 'Namespace may already exist'
-        
+
         echo 'Creating input topic...'
         bin/pulsar-admin --admin-url=http://pulsar:8080 topics create-partitioned-topic public/transcribe/file-queue -p 4 || echo 'Input topic may already exist'
-        
+
         echo 'Creating output topic...'
         bin/pulsar-admin --admin-url=http://pulsar:8080 topics create-partitioned-topic public/transcribe/transcription-results -p 4 || echo 'Output topic may already exist'
-        
+
         echo 'Pulsar initialization completed successfully'
       "
     depends_on:
