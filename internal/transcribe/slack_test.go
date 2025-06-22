@@ -10,6 +10,11 @@ import (
 )
 
 func TestBuildRescueTrailBlocks(t *testing.T) {
+
+	loc, err := time.LoadLocation("America/Los_Angeles")
+	assert.NoError(t, err, "should load PDT timezone")
+	time.Local = loc
+
 	tacChannel := "TAC3"
 	transcriptionText := "Battalion 181 Engine 1838 171 26700 Southeast Issaqua Fall City Road Rescue Trail TAC 3 Battalion 181 Engine 1838 171 26700 Southeast Issaqua Fall City Road 16 27 hours"
 	expiresAt := time.Date(2025, 6, 21, 10, 10, 0, 0, time.Local)
