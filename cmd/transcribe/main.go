@@ -129,7 +129,9 @@ func main() {
 		slog.Error("failed to create dragonfly client", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-	defer dragonflyClient.Close()
+	defer func() {
+		_ = dragonflyClient.Close()
+	}()
 
 	transcribeClient := transcribe.NewTranscribeClient(c, pulsarClient, s3Client, asrClient, ollamaClient, dragonflyClient)
 
