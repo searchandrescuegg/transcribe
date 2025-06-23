@@ -26,7 +26,7 @@ func (tc *TranscribeClient) IsObjectAllowed(ctx context.Context, key string) (bo
 		ti: &talkgroupInfo,
 	}
 
-	res, err := tc.dragonflyClient.SMisMember(ctx, "allowed_talkgroups", parsedKey.Talkgroup)
+	res, err := tc.dragonflyClient.SMisMember(ctx, "allowed_talkgroups", adk.ti.TGID)
 	if err != nil {
 		return false, nil, fmt.Errorf("failed to check talkgroup membership: %w", err)
 	}

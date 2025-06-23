@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -12,11 +13,12 @@ import (
 )
 
 type S3Client struct {
-	client *s3.Client
-	bucket string
+	client         *s3.Client
+	bucket         string
+	defaultTimeout time.Duration
 }
 
-func NewS3Client(accessKey string, secretKey string, endpoint string, region string, bucket string) (*S3Client, error) {
+func NewS3Client(accessKey string, secretKey string, endpoint string, region string, bucket string, defaultTimeout time.Duration) (*S3Client, error) {
 	cfg, err := config.LoadDefaultConfig(context.TODO(),
 		config.WithRegion(region),
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")),
@@ -31,13 +33,17 @@ func NewS3Client(accessKey string, secretKey string, endpoint string, region str
 	})
 
 	return &S3Client{
-		client: client,
-		bucket: bucket,
+		client:         client,
+		bucket:         bucket,
+		defaultTimeout: defaultTimeout,
 	}, nil
 }
 
 func (c *S3Client) GetFile(ctx context.Context, key string) (io.ReadCloser, error) {
-	result, err := c.client.GetObject(ctx, &s3.GetObjectInput{
+	getFileCtx, cancel := context.WithTimeout(ctx, c.defaultTimeout)
+	defer cancel()
+
+	result, err := c.client.GetObject(getFileCtx, &s3.GetObjectInput{
 		Bucket: aws.String(c.bucket),
 		Key:    aws.String(key),
 	})
