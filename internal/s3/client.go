@@ -39,7 +39,9 @@ func NewS3Client(accessKey string, secretKey string, endpoint string, region str
 	}, nil
 }
 
-func (c *S3Client) GetFile(ctx context.Context, key string) (io.ReadCloser, error) {
+func (c *S3Client) GetFile(ctx context.Context, key string) ([]byte, error) {
+	fmt.Println("defaultTimeout", c.defaultTimeout)
+
 	getFileCtx, cancel := context.WithTimeout(ctx, c.defaultTimeout)
 	defer cancel()
 
@@ -51,5 +53,13 @@ func (c *S3Client) GetFile(ctx context.Context, key string) (io.ReadCloser, erro
 		return nil, fmt.Errorf("failed to get object from S3: %w", err)
 	}
 
-	return result.Body, nil
+	bodyBytes, err := io.ReadAll(result.Body) // Read the body to ensure it is not nil
+	if err != nil {
+		return nil, fmt.Errorf("failed to read object body: %w", err)
+	}
+	if result.Body == nil {
+		return nil, fmt.Errorf("object body is nil for key: %s", key)
+	}
+
+	return bodyBytes, nil
 }
