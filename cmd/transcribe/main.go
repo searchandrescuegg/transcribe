@@ -104,13 +104,13 @@ func main() {
 	}
 	defer pulsarClient.Close()
 
-	s3Client, err := s3.NewS3Client(c.S3AccessKey, c.S3SecretKey, c.S3Endpoint, c.S3Region, c.S3Bucket)
+	s3Client, err := s3.NewS3Client(c.S3AccessKey, c.S3SecretKey, c.S3Endpoint, c.S3Region, c.S3Bucket, c.S3Timeout)
 	if err != nil {
 		slog.Error("could not create s3 client", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
 
-	asrClient := asr.NewASRClient(c.ASREndpoint)
+	asrClient := asr.NewASRClient(c.ASREndpoint, c.ASRTimeout)
 
 	ollamaClient, err := ollama.NewOllamaClient(&url.URL{Scheme: c.OllamaProtocol, Host: c.OllamaHost}, &http.Client{
 		Timeout: 30 * time.Second,
@@ -120,7 +120,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	dragonflyClient, err := dragonfly.NewClient(ctx, &redis.Options{
+	dragonflyClient, err := dragonfly.NewClient(ctx, c.DragonflyRequestTimeout, &redis.Options{
 		Addr:     c.DragonflyAddress,
 		Password: c.DragonflyPassword,
 		DB:       c.DragonflyDB,

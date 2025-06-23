@@ -47,24 +47,33 @@ func (tc *TranscribeClient) Work(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		default:
-			msg, err := tc.pulsarClient.Receive(ctx)
+			workCtx, workCancel := context.WithTimeout(ctx, time.Duration(tc.config.WorkerTimeout))
+
+			msg, err := tc.pulsarClient.Receive(workCtx)
 			if err != nil {
 				slog.Error("failed to receive message from pulsar", slog.String("error", err.Error()))
+				tc.pulsarClient.Nack(msg)
+				workCancel()
 				continue
 			}
+
+			slog.Debug("received message from pulsar", slog.String("message_id", msg.ID().String()))
 
 			var eventSchema s3event.EventSchema
 			if err := json.Unmarshal(msg.Payload(), &eventSchema); err != nil {
 				slog.Error("failed to unmarshal S3 event", slog.String("error", err.Error()))
 
 				tc.pulsarClient.Nack(msg)
+				workCancel()
 				continue
 			}
+
+			slog.Debug("unmarshalled S3 event", slog.Any("event_schema", eventSchema))
 
 			for _, record := range eventSchema.Records {
 				if record.EventName != s3event.EventObjectCreatedPut &&
 					record.EventName != s3event.EventObjectCreatedPost {
-					// fmt.Printf("Skipping event: %s\n", record.EventName)
+					slog.Debug("skipping non-object-created event", slog.String("event_name", string(record.EventName)))
 					continue
 				}
 
@@ -74,7 +83,9 @@ func (tc *TranscribeClient) Work(ctx context.Context) {
 					continue
 				}
 
-				isAllowed, parsedKey, err := tc.IsObjectAllowed(ctx, record.S3.Object.Key)
+				slog.Debug("processing S3 object", slog.String("key", record.S3.Object.Key))
+
+				isAllowed, parsedKey, err := tc.IsObjectAllowed(workCtx, record.S3.Object.Key)
 				if err != nil {
 					slog.Error("failed to check if object is allowed", slog.String("error", err.Error()), slog.String("key", record.S3.Object.Key))
 					continue
@@ -85,13 +96,17 @@ func (tc *TranscribeClient) Work(ctx context.Context) {
 					continue
 				}
 
-				fileCloser, err := tc.s3Client.GetFile(ctx, record.S3.Object.Key)
+				slog.Debug("object is allowed", slog.String("key", record.S3.Object.Key), slog.Any("parsed_key", parsedKey))
+
+				fileCloser, err := tc.s3Client.GetFile(workCtx, record.S3.Object.Key)
 				if err != nil {
 					slog.Error("failed to get S3 file", slog.String("error", err.Error()), slog.String("key", record.S3.Object.Key))
 					continue
 				}
 
-				tr, err := tc.asrClient.Transcribe(ctx, record.S3.Object.Key, fileCloser)
+				slog.Debug("got S3 file", slog.String("key", record.S3.Object.Key))
+
+				tr, err := tc.asrClient.Transcribe(workCtx, record.S3.Object.Key, fileCloser)
 				if err != nil {
 					slog.Error("failed to transcribe file", slog.String("error", err.Error()), slog.String("key", record.S3.Object.Key))
 					continue
@@ -100,11 +115,15 @@ func (tc *TranscribeClient) Work(ctx context.Context) {
 				slog.Info("transcription completed", slog.String("key", record.S3.Object.Key), slog.String("transcription", tr.Transcription))
 
 				if parsedKey.dk.Talkgroup == "1399" { // Fire Dispatch
+					slog.Debug("processing fire dispatch transcription", slog.String("talkgroup", parsedKey.dk.Talkgroup), slog.String("transcription", tr.Transcription))
+
 					dispatchMessage, err := tc.ollamaClient.ParseRelevantInformationFromDispatchMessage(tr.Transcription)
 					if err != nil {
 						slog.Error("failed to parse relevant information from dispatch message", slog.String("error", err.Error()), slog.String("transcription", tr.Transcription))
 						continue
 					}
+
+					slog.Debug("parsed dispatch message", slog.Any("dispatch_message", dispatchMessage))
 
 					if !CallIsTrailRescue(dispatchMessage.CallType) {
 						slog.Debug("call is not a trail rescue", slog.String("call_type", dispatchMessage.CallType))
@@ -112,42 +131,56 @@ func (tc *TranscribeClient) Work(ctx context.Context) {
 					}
 
 					slog.Info("trail rescue call detected", slog.String("call_type", dispatchMessage.CallType), slog.String("tac_channel", dispatchMessage.TACChannel))
+
 					tg, ok := talkgroupFromRadioShortCode[dispatchMessage.TACChannel]
 					if !ok {
 						slog.Error("failed to find talkgroup for TAC channel", slog.String("tac_channel", dispatchMessage.TACChannel))
 						continue
 					}
 
-					err = tc.dragonflyClient.SAddEx(ctx, "allowed_talkgroups", dragonfly.DefaultExpiration, tg)
+					err = tc.dragonflyClient.SAddEx(workCtx, "allowed_talkgroups", tc.config.TacticalChannelActivationDuration, tg.TGID)
 					if err != nil {
 						slog.Error("failed to add TAC channel to allowed talkgroups", slog.String("error", err.Error()), slog.String("tac_channel", dispatchMessage.TACChannel), slog.Any("talkgroup", tg))
 						continue
 					}
 
 					slog.Info("added TAC channel to allowed talkgroups", slog.String("tac_channel", dispatchMessage.TACChannel), slog.Any("talkgroup", tg))
-					expiresAt := time.Now().Add(dragonfly.DefaultExpiration).Local()
 
-					_, tsThread, _, err := tc.slackClient.SendMessageContext(ctx, tc.config.SlackChannelID, slack.MsgOptionBlocks(BuildRescueTrailBlocks(&RescueTrailBlocksInput{
+					expiresAt := time.Now().Add(tc.config.TacticalChannelActivationDuration).Local()
+
+					sendMessageCtx, sendMessageCancel := context.WithTimeout(workCtx, tc.config.SlackTimeout)
+
+					_, tsThread, _, err := tc.slackClient.SendMessageContext(sendMessageCtx, tc.config.SlackChannelID, slack.MsgOptionBlocks(BuildRescueTrailBlocks(&RescueTrailBlocksInput{
 						TACChannel:        dispatchMessage.TACChannel,
 						TranscriptionText: tr.Transcription,
 						ExpiresAt:         expiresAt,
 					})...))
 					if err != nil {
+						sendMessageCancel()
 						slog.Error("failed to post message to Slack", slog.String("error", err.Error()))
 					}
+					sendMessageCancel()
 
-					err = tc.dragonflyClient.Set(ctx, fmt.Sprintf("tg:%s", tg.TGID), dragonfly.DefaultExpiration, tsThread)
+					slog.Debug("posted message to slack", slog.String("tac_channel", dispatchMessage.TACChannel), slog.String("thread_id", tsThread))
+
+					err = tc.dragonflyClient.Set(workCtx, fmt.Sprintf("tg:%s", tg.TGID), tc.config.TacticalChannelActivationDuration, tsThread)
 					if err != nil {
 						slog.Error("failed to set TAC channel in Dragonfly", slog.String("error", err.Error()))
 					}
 
-					time.AfterFunc(dragonfly.DefaultExpiration, func() {
+					slog.Debug("set TAC channel in Dragonfly", slog.String("tac_channel", dispatchMessage.TACChannel), slog.String("thread_id", tsThread))
+
+					time.AfterFunc(tc.config.TacticalChannelActivationDuration, func() {
+						slog.Debug("TAC channel expiration reached, posting channel closed message", slog.String("tac_channel", dispatchMessage.TACChannel))
+
 						channelClosedInput := ChannelClosedBlocksInput{
 							Channel:  dispatchMessage.TACChannel,
 							ClosedAt: time.Now().Local(),
 						}
 
-						_, _, _, err = tc.slackClient.SendMessageContext(ctx, "C09363Q926L",
+						sendMessageCtx, sendMessageCancel := context.WithTimeout(workCtx, tc.config.SlackTimeout)
+
+						_, _, _, err = tc.slackClient.SendMessageContext(sendMessageCtx, tc.config.SlackChannelID,
 							slack.MsgOptionBlocks(BuildChannelClosedBlocks(&channelClosedInput)...),
 							slack.MsgOptionAsUser(true),
 							slack.MsgOptionTS(tsThread),
@@ -155,8 +188,12 @@ func (tc *TranscribeClient) Work(ctx context.Context) {
 						)
 						if err != nil {
 							fmt.Printf("Error posting channel closed message: %v\n", err)
+							sendMessageCancel()
 							return
 						}
+						sendMessageCancel()
+
+						slog.Debug("posted channel closed message to Slack", slog.String("tac_channel", dispatchMessage.TACChannel), slog.String("thread_id", tsThread))
 					},
 					)
 
@@ -164,11 +201,13 @@ func (tc *TranscribeClient) Work(ctx context.Context) {
 					slog.Debug("call is not a fire dispatch", slog.String("talkgroup", parsedKey.dk.Talkgroup), slog.String("transcription", tr.Transcription))
 
 					// get slack thread ID from Dragonfly
-					tsThread, err := tc.dragonflyClient.Get(ctx, fmt.Sprintf("tg:%s", parsedKey.dk.Talkgroup))
+					tsThread, err := tc.dragonflyClient.Get(workCtx, fmt.Sprintf("tg:%s", parsedKey.dk.Talkgroup))
 					if err != nil {
 						slog.Error("failed to get thread ID from Dragonfly", slog.String("error", err.Error()), slog.String("talkgroup", parsedKey.dk.Talkgroup))
 						continue
 					}
+
+					slog.Debug("got thread ID from Dragonfly", slog.String("talkgroup", parsedKey.dk.Talkgroup), slog.String("thread_id", tsThread))
 
 					if tsThread == "" {
 						slog.Debug("no thread ID found for talkgroup", slog.String("talkgroup", parsedKey.dk.Talkgroup))
@@ -182,7 +221,11 @@ func (tc *TranscribeClient) Work(ctx context.Context) {
 						continue
 					}
 
-					_, _, _, err = tc.slackClient.SendMessageContext(ctx, tc.config.SlackChannelID,
+					slog.Debug("found talkgroup information", slog.String("talkgroup", parsedKey.dk.Talkgroup), slog.Any("talkgroup_info", tgInfo))
+
+					sendMessageCtx, sendMessageCancel := context.WithTimeout(workCtx, tc.config.SlackTimeout)
+
+					_, _, _, err = tc.slackClient.SendMessageContext(sendMessageCtx, tc.config.SlackChannelID,
 						slack.MsgOptionBlocks(BuildThreadCommunicationBlocks(&ThreadCommunicationBlocksInput{
 							Channel: tgInfo.FullName,
 							Message: tr.Transcription,
@@ -192,8 +235,12 @@ func (tc *TranscribeClient) Work(ctx context.Context) {
 						slack.MsgOptionTS(tsThread),
 					)
 					if err != nil {
+						sendMessageCancel()
 						slog.Error("failed to post transcription message to Slack", slog.String("error", err.Error()), slog.String("talkgroup", parsedKey.dk.Talkgroup))
 					}
+					sendMessageCancel()
+
+					slog.Debug("posted transcription message to Slack", slog.String("talkgroup", parsedKey.dk.Talkgroup), slog.String("thread_id", tsThread))
 
 				}
 			}
@@ -202,6 +249,10 @@ func (tc *TranscribeClient) Work(ctx context.Context) {
 			if err != nil {
 				slog.Error("failed to acknowledge message", slog.String("error", err.Error()))
 			}
+
+			slog.Debug("acknowledged message", slog.String("message_id", msg.ID().String()))
+
+			workCancel()
 
 		}
 	}
