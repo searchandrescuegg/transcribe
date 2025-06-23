@@ -33,11 +33,13 @@ func NewTranscribeClient(config *config.Config, pulsarClient *pulsar.PulsarClien
 	slackClient := slack.New(config.SlackToken)
 
 	return &TranscribeClient{
-		pulsarClient: pulsarClient,
-		s3Client:     s3Client,
-		asrClient:    asrClient,
-		ollamaClient: ollamaClient,
-		slackClient:  slackClient,
+		pulsarClient:    pulsarClient,
+		s3Client:        s3Client,
+		asrClient:       asrClient,
+		ollamaClient:    ollamaClient,
+		slackClient:     slackClient,
+		dragonflyClient: dragonflyClient,
+		config:          config,
 	}
 }
 

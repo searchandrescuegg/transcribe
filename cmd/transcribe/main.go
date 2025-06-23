@@ -140,7 +140,7 @@ func main() {
 
 	slog.Info("starting transcribe service", slog.Int("workers", c.WorkerCount))
 
-	workerPool := pool.New().WithMaxGoroutines(c.WorkerCount)
+	workerPool := pool.New()
 
 	processingCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
