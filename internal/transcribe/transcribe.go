@@ -1,6 +1,7 @@
 package transcribe
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -100,7 +101,7 @@ func (tc *TranscribeClient) Work(ctx context.Context) {
 
 				slog.Debug("object is allowed", slog.String("key", record.S3.Object.Key), slog.Any("parsed_key", parsedKey))
 
-				fileCloser, err := tc.s3Client.GetFile(workCtx, record.S3.Object.Key)
+				fileBytes, err := tc.s3Client.GetFile(workCtx, record.S3.Object.Key)
 				if err != nil {
 					slog.Error("failed to get S3 file", slog.String("error", err.Error()), slog.String("key", record.S3.Object.Key))
 					continue
@@ -108,7 +109,7 @@ func (tc *TranscribeClient) Work(ctx context.Context) {
 
 				slog.Debug("got S3 file", slog.String("key", record.S3.Object.Key))
 
-				tr, err := tc.asrClient.Transcribe(workCtx, record.S3.Object.Key, fileCloser)
+				tr, err := tc.asrClient.Transcribe(workCtx, record.S3.Object.Key, bytes.NewBuffer(fileBytes))
 				if err != nil {
 					slog.Error("failed to transcribe file", slog.String("error", err.Error()), slog.String("key", record.S3.Object.Key))
 					continue
