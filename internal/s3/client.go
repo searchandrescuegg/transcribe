@@ -40,8 +40,6 @@ func NewS3Client(accessKey string, secretKey string, endpoint string, region str
 }
 
 func (c *S3Client) GetFile(ctx context.Context, key string) ([]byte, error) {
-	fmt.Println("defaultTimeout", c.defaultTimeout)
-
 	getFileCtx, cancel := context.WithTimeout(ctx, c.defaultTimeout)
 	defer cancel()
 
