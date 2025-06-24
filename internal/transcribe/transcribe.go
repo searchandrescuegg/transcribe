@@ -50,15 +50,16 @@ func (tc *TranscribeClient) Work(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		default:
-			workCtx, workCancel := context.WithTimeout(ctx, time.Duration(tc.config.WorkerTimeout))
-
-			msg, err := tc.pulsarClient.Receive(workCtx)
+			msg, err := tc.pulsarClient.Receive(ctx)
 			if err != nil {
 				slog.Error("failed to receive message from pulsar", slog.String("error", err.Error()))
-				tc.pulsarClient.Nack(msg)
-				workCancel()
+				if msg != nil {
+					tc.pulsarClient.Nack(msg)
+				}
 				continue
 			}
+
+			workCtx, workCancel := context.WithTimeout(ctx, time.Duration(tc.config.WorkerTimeout))
 
 			slog.Debug("received message from pulsar", slog.String("message_id", msg.ID().String()))
 
