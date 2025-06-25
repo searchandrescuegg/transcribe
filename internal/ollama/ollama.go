@@ -48,6 +48,7 @@ func (oc *OllamaClient) ParseRelevantInformationFromDispatchMessage(transcriptio
 			You will need to extract the call type and the tactical channel (TAC) from the transcription.
 			Please return the information in the JSON format defined below.
 			Call types can include "Aid Emergency", "MVC", "MVC Aid Emergency", "AFA Commercial", "Rescue - Trail", etc.
+			If the call type can not be determined, return "Unknown".
 			The tactical channel (TAC) should be in the format "TAC1", "TAC2", etc. Do not include a space between "TAC" and the number.
 			Do not add any additional information or context that is not present in the transcription.
 			`,
