@@ -3,8 +3,10 @@ package pulsar
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"github.com/apache/pulsar-client-go/pulsar"
+	"github.com/apache/pulsar-client-go/pulsar/log"
 )
 
 type PulsarClient struct {
@@ -14,7 +16,8 @@ type PulsarClient struct {
 
 func NewPulsarClient(url string, inputTopic string, subscription string) (*PulsarClient, error) {
 	client, err := pulsar.NewClient(pulsar.ClientOptions{
-		URL: url,
+		URL:    url,
+		Logger: log.NewLoggerWithSlog(slog.Default()),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create pulsar client: %w", err)
