@@ -67,6 +67,21 @@ func TestCallIsTrailRescue(t *testing.T) {
 			calltype: "Trail - Rescue",
 			want:     true,
 		},
+		{
+			name:     "fuzzy match with levenshtein",
+			calltype: "train rescue",
+			want:     true,
+		},
+		{
+			name:     "fuzzy match with levenshtein 2",
+			calltype: "trails fescue",
+			want:     true,
+		},
+		{
+			name:     "fuzzy match failure",
+			calltype: "snails rescue",
+			want:     false,
+		},
 	}
 
 	for _, tt := range tests {

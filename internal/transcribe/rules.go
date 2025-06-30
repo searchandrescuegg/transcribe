@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"strings"
+
+	"github.com/agnivade/levenshtein"
 )
 
 type AdornedDeconstructedKey struct {
@@ -43,12 +45,28 @@ func (tc *TranscribeClient) IsObjectAllowed(ctx context.Context, key string) (bo
 	return false, nil, nil
 }
 
-// could use github.com/agnivade/levenshtein to get a more fuzzy match
 func CallIsTrailRescue(calltype string) bool {
 	calltype = strings.ToLower(calltype)
+
+	// Exact match first (most efficient)
 	if strings.Contains(calltype, "trail") && strings.Contains(calltype, "rescue") {
 		return true
 	}
 
-	return false
+	// Fuzzy match with levenshtein distance
+	words := strings.Fields(calltype)
+	hasTrailMatch := false
+	hasRescueMatch := false
+
+	for _, word := range words {
+		// Allow up to 2 character differences for fuzzy matching
+		if levenshtein.ComputeDistance(word, "trail") <= 2 {
+			hasTrailMatch = true
+		}
+		if levenshtein.ComputeDistance(word, "rescue") <= 2 {
+			hasRescueMatch = true
+		}
+	}
+
+	return hasTrailMatch && hasRescueMatch
 }
