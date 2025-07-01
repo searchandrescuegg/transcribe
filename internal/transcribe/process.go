@@ -29,7 +29,7 @@ func (tc *TranscribeClient) processDispatchCall(ctx context.Context, parsedKey *
 	slog.Debug("parsed dispatch message", slog.Any("dispatch_message", dispatchMessage))
 
 	if !CallIsTrailRescue(dispatchMessage.CallType) {
-		slog.Debug("call is not a trail rescue", slog.String("call_type", dispatchMessage.CallType))
+		slog.Warn("call is not a trail rescue", slog.String("call_type", dispatchMessage.CallType), slog.String("transcription", tr.Transcription))
 		return nil
 	}
 
