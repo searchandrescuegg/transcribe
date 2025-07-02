@@ -114,7 +114,7 @@ func main() {
 
 	ollamaClient, err := ollama.NewOllamaClient(&url.URL{Scheme: c.OllamaProtocol, Host: c.OllamaHost}, &http.Client{
 		Timeout: 30 * time.Second,
-	})
+	}, c.OllamaModel)
 	if err != nil {
 		slog.Error("could not create ollama client", slog.String("error", err.Error()))
 		os.Exit(1)
