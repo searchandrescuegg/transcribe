@@ -36,7 +36,8 @@ type Config struct {
 
 	OllamaProtocol string        `env:"OLLAMA_PROTOCOL" envDefault:"http"`
 	OllamaHost     string        `env:"OLLAMA_HOST" envDefault:"localhost"`
-	OllamaTimeout  time.Duration `env:"OLLAMA_TIMEOUT" envDefault:"15s"` // Timeout for Ollama requests in seconds
+	OllamaModel    string        `env:"OLLAMA_MODEL" envDefault:"llama3.1:8b"` // Model to use for Ollama
+	OllamaTimeout  time.Duration `env:"OLLAMA_TIMEOUT" envDefault:"15s"`       // Timeout for Ollama requests in seconds
 
 	DragonflyAddress        string        `env:"DRAGONFLY_ADDRESS" envDefault:"localhost:6379"`
 	DragonflyPassword       string        `env:"DRAGONFLY_PASSWORD"`

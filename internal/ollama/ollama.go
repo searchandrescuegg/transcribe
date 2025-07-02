@@ -12,10 +12,11 @@ import (
 
 type OllamaClient struct {
 	client *ollama.Client
+	model  string
 }
 
-func NewOllamaClient(baseUrl *url.URL, httpClient *http.Client) (*OllamaClient, error) {
-	return &OllamaClient{client: ollama.NewClient(baseUrl, httpClient)}, nil
+func NewOllamaClient(baseUrl *url.URL, httpClient *http.Client, model string) (*OllamaClient, error) {
+	return &OllamaClient{client: ollama.NewClient(baseUrl, httpClient), model: model}, nil
 }
 
 type DispatchMessage struct {
@@ -43,7 +44,7 @@ var DispatchMessageResponseFormat = json.RawMessage(`{
 func (oc *OllamaClient) ParseRelevantInformationFromDispatchMessage(transcription string) (*DispatchMessage, error) {
 	ctx := context.Background()
 	req := &ollama.GenerateRequest{
-		Model: "llama3.1:8b",
+		Model: oc.model,
 		System: `You are a tool to accurately parse relevant information from a transcription of Fire Department radio messages.
 			You will need to extract the call type and the tactical channel (TAC) from the transcription.
 			Please return the information in the JSON format defined below.
