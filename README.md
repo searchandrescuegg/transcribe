@@ -33,8 +33,11 @@ The service processes audio files from fire dispatch channels, intelligently det
 4. **Scalable Processing Architecture**  
    Configurable worker pool processes multiple audio files concurrently using Apache Pulsar for reliable message queuing and S3 for audio file storage.
 
-5. **Comprehensive Integration**  
-   Combines ASR transcription, Ollama AI analysis, Redis caching for channel management, and Slack messaging in a unified monitoring pipeline with full observability.
+5. **Flexible AI Backend Support**  
+   Supports multiple ML backends (Ollama and OpenAI) for dispatch message analysis, allowing deployment flexibility based on infrastructure requirements and cost considerations.
+
+6. **Comprehensive Integration**  
+   Combines ASR transcription, configurable AI analysis, Redis caching for channel management, and Slack messaging in a unified monitoring pipeline with full observability.
 
 <details>
 <summary><strong>System Flow</strong></summary>
@@ -54,7 +57,7 @@ flowchart TD
     H --> I[Transcript Generated]
     
     I --> J{Fire Dispatch<br/>Channel?}
-    J -->|Yes| K[Ollama AI Analysis]
+    J -->|Yes| K[ML Backend Analysis<br/>Ollama or OpenAI]
     J -->|No| R{TAC Channel<br/>Active?}
     
     K --> M{Trail Rescue<br/>Detected?}
@@ -129,7 +132,7 @@ This service includes a complete local development environment using Docker Comp
 - **Apache Pulsar**: Message broker for S3 events and processing queues
 - **S3 Ninja**: S3-compatible storage for radio audio files  
 - **Mock ASR**: Simulated transcription service for testing
-- **Ollama**: AI service running Llama 3.1 8B for dispatch analysis
+- **Ollama**: AI service running Llama 3.1 8B for dispatch analysis (default ML backend)
 - **Dragonfly**: Redis-compatible cache for tactical channel management
 - **Grafana LGTM**: Observability stack (Logs, Grafana, Tempo, Mimir)
 
@@ -166,10 +169,23 @@ S3_ENDPOINT=http://localhost:9444
 S3_BUCKET=audio
 DRAGONFLY_ADDRESS=localhost:6379
 
-# AI & Analysis
-ASR_ENDPOINT=http://localhost:8080/asr
+# ML Backend Selection
+ML_BACKEND=ollama  # Options: "ollama" or "openai"
+
+# Ollama Configuration (when ML_BACKEND=ollama)
 OLLAMA_PROTOCOL=http
 OLLAMA_HOST=localhost:11434
+OLLAMA_MODEL=llama3.1:8b
+OLLAMA_TIMEOUT=15s
+
+# OpenAI Configuration (when ML_BACKEND=openai)
+OPENAI_API_KEY=your-openai-api-key
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_MODEL=gpt-4
+OPENAI_TIMEOUT=30s
+
+# ASR Service
+ASR_ENDPOINT=http://localhost:8080/asr
 
 # Notifications
 SLACK_TOKEN=xoxb-your-bot-token
@@ -180,6 +196,24 @@ WORKER_COUNT=5
 LOG_LEVEL=info
 METRICS_ENABLED=true
 ```
+
+#### ML Backend Selection
+
+The service supports two ML backends for analyzing dispatch messages:
+
+**Ollama (Default)**
+- Runs locally with Llama 3.1 8B model
+- No external API costs
+- Requires local GPU/CPU resources
+- Ideal for on-premise deployments
+
+**OpenAI**
+- Uses OpenAI's GPT models via API
+- Requires API key and incurs usage costs
+- Faster processing with high-quality analysis
+- Ideal for cloud deployments
+
+To switch between backends, set `ML_BACKEND=openai` and provide your `OPENAI_API_KEY`. The service will automatically validate the configuration and initialize the appropriate backend at startup.
 
 ### Testing
 

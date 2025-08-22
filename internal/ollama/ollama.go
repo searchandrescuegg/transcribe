@@ -8,6 +8,7 @@ import (
 	"net/url"
 
 	ollama "github.com/ollama/ollama/api"
+	"github.com/searchandrescuegg/transcribe/internal/ml"
 )
 
 type OllamaClient struct {
@@ -19,11 +20,6 @@ func NewOllamaClient(baseUrl *url.URL, httpClient *http.Client, model string) (*
 	return &OllamaClient{client: ollama.NewClient(baseUrl, httpClient), model: model}, nil
 }
 
-type DispatchMessage struct {
-	CallType      string `json:"call_type"`
-	TACChannel    string `json:"tac_channel"`
-	Transcription string `json:"transcription"`
-}
 
 var DispatchMessageResponseFormat = json.RawMessage(`{
   "type": "object",
@@ -33,24 +29,29 @@ var DispatchMessageResponseFormat = json.RawMessage(`{
     },
 	"tac_channel": {
       "type": "string"
+    },
+	"cleaned_transcription": {
+      "type": "string"
     }
   },
   "required": [
     "call_type",
-    "tac_channel"
+    "tac_channel",
+    "cleaned_transcription"
   ]
 }`)
 
-func (oc *OllamaClient) ParseRelevantInformationFromDispatchMessage(transcription string) (*DispatchMessage, error) {
+func (oc *OllamaClient) ParseRelevantInformationFromDispatchMessage(transcription string) (*ml.DispatchMessage, error) {
 	ctx := context.Background()
 	req := &ollama.GenerateRequest{
 		Model: oc.model,
 		System: `You are a tool to accurately parse relevant information from a transcription of Fire Department radio messages.
-			You will need to extract the call type and the tactical channel (TAC) from the transcription.
+			You will need to extract the call type and the tactical channel (TAC) from the transcription, including the FULL transcription.
 			Please return the information in the JSON format defined below.
 			Call types can include "Aid Emergency", "MVC", "MVC Aid Emergency", "AFA Commercial", "Rescue - Trail", etc.
 			If the call type can not be determined, return "Unknown".
-			The tactical channel (TAC) should be in the format "TAC1", "TAC2", etc. Do not include a space between "TAC" and the number.
+			The tactical channel (TAC) should be in the format "TAC1", "TAC2", etc. Do not include a space between "TAC" and the number. If it appears as SPFR Repeater, assume it is "TAC8".
+			Please clean the transcription to update any misspellings, incorrect locations, and generally ensure that it is clear and concise.
 			Do not add any additional information or context that is not present in the transcription.
 			`,
 		Prompt: transcription,
@@ -58,12 +59,12 @@ func (oc *OllamaClient) ParseRelevantInformationFromDispatchMessage(transcriptio
 		Stream: func(b bool) *bool { return &b }(false),
 	}
 
-	var result *DispatchMessage
+	var result *ml.DispatchMessage
 	respFunc := func(resp ollama.GenerateResponse) error {
 		if !resp.Done {
 			return nil // Continue processing until the response is complete
 		}
-		var dispatchMessageResponse DispatchMessage
+		var dispatchMessageResponse ml.DispatchMessage
 
 		if err := json.Unmarshal([]byte(resp.Response), &dispatchMessageResponse); err != nil {
 			return fmt.Errorf("failed to unmarshal transcription response: %w", err)
