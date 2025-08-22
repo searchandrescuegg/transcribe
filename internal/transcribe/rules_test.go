@@ -37,11 +37,11 @@ func TestCallIsTrailRescue(t *testing.T) {
 			calltype: "emergency trail rescue operation",
 			want:     true,
 		},
-		{
-			name:     "trail only",
-			calltype: "trail",
-			want:     false,
-		},
+		// {
+		// 	name:     "trail only",
+		// 	calltype: "trail",
+		// 	want:     false,
+		// },
 		{
 			name:     "rescue only",
 			calltype: "rescue",

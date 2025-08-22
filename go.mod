@@ -6,6 +6,7 @@ toolchain go1.24.2
 
 require (
 	alpineworks.io/ootel v1.0.4
+	github.com/agnivade/levenshtein v1.2.1
 	github.com/apache/pulsar-client-go v0.15.1
 	github.com/aws/aws-sdk-go-v2 v1.36.4
 	github.com/aws/aws-sdk-go-v2/config v1.29.16
@@ -14,6 +15,7 @@ require (
 	github.com/caarlos0/env/v11 v11.3.1
 	github.com/ollama/ollama v0.9.2
 	github.com/redis/go-redis/v9 v9.10.0
+	github.com/sashabaranov/go-openai v1.41.1
 	github.com/slack-go/slack v0.17.1
 	github.com/sourcegraph/conc v0.3.0
 	github.com/stretchr/testify v1.10.0
@@ -29,7 +31,6 @@ require (
 	github.com/Azure/go-ansiterm v0.0.0-20230124172434-306776ec8161 // indirect
 	github.com/Azure/go-ntlmssp v0.0.0-20221128193559-754e69321358 // indirect
 	github.com/DataDog/zstd v1.5.0 // indirect
-	github.com/agnivade/levenshtein v1.2.1 // indirect
 	github.com/andybalholm/brotli v1.1.1 // indirect
 	github.com/ardielle/ardielle-go v1.5.2 // indirect
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.6.10 // indirect

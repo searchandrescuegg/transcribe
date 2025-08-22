@@ -21,7 +21,7 @@ var (
 func (tc *TranscribeClient) processDispatchCall(ctx context.Context, parsedKey *AdornedDeconstructedKey, tr *asr.TranscriptionResponse) error {
 	slog.Debug("processing fire dispatch transcription", slog.String("talkgroup", parsedKey.dk.Talkgroup), slog.String("transcription", tr.Transcription))
 
-	dispatchMessage, err := tc.ollamaClient.ParseRelevantInformationFromDispatchMessage(tr.Transcription)
+	dispatchMessage, err := tc.mlClient.ParseRelevantInformationFromDispatchMessage(tr.Transcription)
 	if err != nil {
 		return fmt.Errorf("%w: %s", ErrFailedToParseDispatchMessage, err.Error())
 	}

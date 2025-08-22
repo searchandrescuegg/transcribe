@@ -48,25 +48,19 @@ func (tc *TranscribeClient) IsObjectAllowed(ctx context.Context, key string) (bo
 func CallIsTrailRescue(calltype string) bool {
 	calltype = strings.ToLower(calltype)
 
-	// Exact match first (most efficient)
-	if strings.Contains(calltype, "trail") && strings.Contains(calltype, "rescue") {
+	// Check for exact trail match first
+	if strings.Contains(calltype, "trail") {
 		return true
 	}
 
-	// Fuzzy match with levenshtein distance
+	// Fuzzy match for trail with levenshtein distance
 	words := strings.Fields(calltype)
-	hasTrailMatch := false
-	hasRescueMatch := false
-
 	for _, word := range words {
-		// Allow up to 2 character differences for fuzzy matching
+		// Allow up to 2 character differences for trail matching
 		if levenshtein.ComputeDistance(word, "trail") <= 2 {
-			hasTrailMatch = true
-		}
-		if levenshtein.ComputeDistance(word, "rescue") <= 2 {
-			hasRescueMatch = true
+			return true
 		}
 	}
 
-	return hasTrailMatch && hasRescueMatch
+	return false
 }

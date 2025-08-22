@@ -13,10 +13,13 @@ import (
 
 	"alpineworks.io/ootel"
 	"github.com/redis/go-redis/v9"
+	openai "github.com/sashabaranov/go-openai"
 	"github.com/searchandrescuegg/transcribe/internal/config"
 	"github.com/searchandrescuegg/transcribe/internal/dragonfly"
 	"github.com/searchandrescuegg/transcribe/internal/logging"
+	"github.com/searchandrescuegg/transcribe/internal/ml"
 	"github.com/searchandrescuegg/transcribe/internal/ollama"
+	openaiClient "github.com/searchandrescuegg/transcribe/internal/openai"
 	"github.com/searchandrescuegg/transcribe/internal/pulsar"
 	"github.com/searchandrescuegg/transcribe/internal/s3"
 	"github.com/searchandrescuegg/transcribe/internal/transcribe"
@@ -112,11 +115,36 @@ func main() {
 
 	asrClient := asr.NewASRClient(c.ASREndpoint, c.ASRTimeout)
 
-	ollamaClient, err := ollama.NewOllamaClient(&url.URL{Scheme: c.OllamaProtocol, Host: c.OllamaHost}, &http.Client{
-		Timeout: 30 * time.Second,
-	}, c.OllamaModel)
-	if err != nil {
-		slog.Error("could not create ollama client", slog.String("error", err.Error()))
+	// Create ML backend client based on configuration
+	var mlClient ml.DispatchMessageParser
+	switch c.MLBackend {
+	case "openai":
+		slog.Info("initializing OpenAI ML backend", slog.String("model", c.OpenAIModel), slog.String("base_url", c.OpenAIBaseURL))
+		if c.OpenAIAPIKey == "" {
+			slog.Error("OpenAI API key is required when using openai backend")
+			os.Exit(1)
+		}
+		openaiConfig := openai.DefaultConfig(c.OpenAIAPIKey)
+		if c.OpenAIBaseURL != "https://api.openai.com/v1" {
+			openaiConfig.BaseURL = c.OpenAIBaseURL
+		}
+		openaiConfig.HTTPClient = &http.Client{Timeout: c.OpenAITimeout}
+		mlClient = openaiClient.NewOpenAIClient(
+			openai.NewClientWithConfig(openaiConfig),
+			c.OpenAIModel,
+		)
+	case "ollama":
+		slog.Info("initializing Ollama ML backend", slog.String("host", c.OllamaHost), slog.String("model", c.OllamaModel))
+		ollamaClient, err := ollama.NewOllamaClient(&url.URL{Scheme: c.OllamaProtocol, Host: c.OllamaHost}, &http.Client{
+			Timeout: c.OllamaTimeout,
+		}, c.OllamaModel)
+		if err != nil {
+			slog.Error("could not create ollama client", slog.String("error", err.Error()))
+			os.Exit(1)
+		}
+		mlClient = ollamaClient
+	default:
+		slog.Error("unsupported ML backend", slog.String("backend", c.MLBackend))
 		os.Exit(1)
 	}
 
@@ -133,7 +161,7 @@ func main() {
 		_ = dragonflyClient.Close()
 	}()
 
-	transcribeClient := transcribe.NewTranscribeClient(c, pulsarClient, s3Client, asrClient, ollamaClient, dragonflyClient)
+	transcribeClient := transcribe.NewTranscribeClient(c, pulsarClient, s3Client, asrClient, mlClient, dragonflyClient)
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)

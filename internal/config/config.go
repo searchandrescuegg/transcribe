@@ -34,10 +34,20 @@ type Config struct {
 	ASREndpoint string        `env:"ASR_ENDPOINT" envDefault:"http://localhost:8080/asr"`
 	ASRTimeout  time.Duration `env:"ASR_TIMEOUT" envDefault:"10s"` // Timeout for ASR requests in seconds
 
+	// ML Backend Configuration
+	MLBackend string `env:"ML_BACKEND" envDefault:"ollama"` // Options: "ollama", "openai"
+
+	// Ollama Configuration
 	OllamaProtocol string        `env:"OLLAMA_PROTOCOL" envDefault:"http"`
 	OllamaHost     string        `env:"OLLAMA_HOST" envDefault:"localhost"`
 	OllamaModel    string        `env:"OLLAMA_MODEL" envDefault:"llama3.1:8b"` // Model to use for Ollama
 	OllamaTimeout  time.Duration `env:"OLLAMA_TIMEOUT" envDefault:"15s"`       // Timeout for Ollama requests in seconds
+
+	// OpenAI Configuration
+	OpenAIAPIKey  string        `env:"OPENAI_API_KEY"`                                  // OpenAI API Key
+	OpenAIBaseURL string        `env:"OPENAI_BASE_URL" envDefault:"https://api.openai.com/v1"` // OpenAI API Base URL
+	OpenAIModel   string        `env:"OPENAI_MODEL" envDefault:"gpt-4"`                 // OpenAI Model to use
+	OpenAITimeout time.Duration `env:"OPENAI_TIMEOUT" envDefault:"30s"`                // Timeout for OpenAI requests in seconds
 
 	DragonflyAddress        string        `env:"DRAGONFLY_ADDRESS" envDefault:"localhost:6379"`
 	DragonflyPassword       string        `env:"DRAGONFLY_PASSWORD"`

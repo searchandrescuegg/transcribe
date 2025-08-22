@@ -10,7 +10,7 @@ import (
 
 	"github.com/searchandrescuegg/transcribe/internal/config"
 	"github.com/searchandrescuegg/transcribe/internal/dragonfly"
-	"github.com/searchandrescuegg/transcribe/internal/ollama"
+	"github.com/searchandrescuegg/transcribe/internal/ml"
 	"github.com/searchandrescuegg/transcribe/internal/pulsar"
 	"github.com/searchandrescuegg/transcribe/internal/s3"
 	"github.com/searchandrescuegg/transcribe/pkg/asr"
@@ -22,21 +22,21 @@ type TranscribeClient struct {
 	pulsarClient    *pulsar.PulsarClient
 	s3Client        *s3.S3Client
 	asrClient       *asr.ASRClient
-	ollamaClient    *ollama.OllamaClient
+	mlClient        ml.DispatchMessageParser
 	slackClient     *slack.Client
 	dragonflyClient *dragonfly.DragonflyClient
 
 	config *config.Config
 }
 
-func NewTranscribeClient(config *config.Config, pulsarClient *pulsar.PulsarClient, s3Client *s3.S3Client, asrClient *asr.ASRClient, ollamaClient *ollama.OllamaClient, dragonflyClient *dragonfly.DragonflyClient) *TranscribeClient {
+func NewTranscribeClient(config *config.Config, pulsarClient *pulsar.PulsarClient, s3Client *s3.S3Client, asrClient *asr.ASRClient, mlClient ml.DispatchMessageParser, dragonflyClient *dragonfly.DragonflyClient) *TranscribeClient {
 	slackClient := slack.New(config.SlackToken)
 
 	return &TranscribeClient{
 		pulsarClient:    pulsarClient,
 		s3Client:        s3Client,
 		asrClient:       asrClient,
-		ollamaClient:    ollamaClient,
+		mlClient:        mlClient,
 		slackClient:     slackClient,
 		dragonflyClient: dragonflyClient,
 		config:          config,
