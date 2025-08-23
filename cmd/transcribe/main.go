@@ -121,8 +121,7 @@ func main() {
 	case "openai":
 		slog.Info("initializing OpenAI ML backend", slog.String("model", c.OpenAIModel), slog.String("base_url", c.OpenAIBaseURL))
 		if c.OpenAIAPIKey == "" {
-			slog.Error("OpenAI API key is required when using openai backend")
-			os.Exit(1)
+			slog.Warn("OpenAI API key not provided - this may be required depending on your endpoint configuration")
 		}
 		openaiConfig := openai.DefaultConfig(c.OpenAIAPIKey)
 		if c.OpenAIBaseURL != "https://api.openai.com/v1" {
