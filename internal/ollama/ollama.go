@@ -20,7 +20,6 @@ func NewOllamaClient(baseUrl *url.URL, httpClient *http.Client, model string) (*
 	return &OllamaClient{client: ollama.NewClient(baseUrl, httpClient), model: model}, nil
 }
 
-
 var DispatchMessageResponseFormat = json.RawMessage(`{
   "type": "object",
   "properties": {
@@ -41,7 +40,7 @@ var DispatchMessageResponseFormat = json.RawMessage(`{
   ]
 }`)
 
-func (oc *OllamaClient) ParseRelevantInformationFromDispatchMessage(transcription string) (*ml.DispatchMessage, error) {
+func (oc *OllamaClient) ParseRelevantInformationFromDispatchMessage(transcription string) (*ml.DispatchMessages, error) {
 	ctx := context.Background()
 	req := &ollama.GenerateRequest{
 		Model: oc.model,
@@ -64,13 +63,12 @@ func (oc *OllamaClient) ParseRelevantInformationFromDispatchMessage(transcriptio
 		if !resp.Done {
 			return nil // Continue processing until the response is complete
 		}
-		var dispatchMessageResponse ml.DispatchMessage
+		var dispatchMessagesResponse ml.DispatchMessage
 
-		if err := json.Unmarshal([]byte(resp.Response), &dispatchMessageResponse); err != nil {
+		if err := json.Unmarshal([]byte(resp.Response), &dispatchMessagesResponse); err != nil {
 			return fmt.Errorf("failed to unmarshal transcription response: %w", err)
 		}
-		dispatchMessageResponse.Transcription = transcription // Include the original transcription in the response
-		result = &dispatchMessageResponse
+		result = &dispatchMessagesResponse
 		return nil
 	}
 
@@ -83,5 +81,18 @@ func (oc *OllamaClient) ParseRelevantInformationFromDispatchMessage(transcriptio
 		return nil, fmt.Errorf("no response received from Ollama")
 	}
 
-	return result, nil
+	messages := []ml.DispatchMessage{
+		{
+			CallType:             result.CallType,
+			TACChannel:           result.TACChannel,
+			CleanedTranscription: result.CleanedTranscription,
+		},
+	}
+
+	finalResult := &ml.DispatchMessages{
+		Messages:      messages,
+		Transcription: transcription,
+	}
+
+	return finalResult, nil
 }
