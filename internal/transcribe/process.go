@@ -21,17 +21,38 @@ var (
 func (tc *TranscribeClient) processDispatchCall(ctx context.Context, parsedKey *AdornedDeconstructedKey, tr *asr.TranscriptionResponse) error {
 	slog.Debug("processing fire dispatch transcription", slog.String("talkgroup", parsedKey.dk.Talkgroup), slog.String("transcription", tr.Transcription))
 
-	dispatchMessage, err := tc.mlClient.ParseRelevantInformationFromDispatchMessage(tr.Transcription)
+	dispatchMessages, err := tc.mlClient.ParseRelevantInformationFromDispatchMessage(tr.Transcription)
 	if err != nil {
 		return fmt.Errorf("%w: %s", ErrFailedToParseDispatchMessage, err.Error())
 	}
 
-	slog.Debug("parsed dispatch message", slog.Any("dispatch_message", dispatchMessage))
+	slog.Debug("parsed dispatch messages", slog.Int("len", len(dispatchMessages.Messages)), slog.Any("dispatch_messages", dispatchMessages))
 
-	if !CallIsTrailRescue(dispatchMessage.CallType) {
-		slog.Warn("call is not a trail rescue", slog.String("call_type", dispatchMessage.CallType), slog.String("transcription", tr.Transcription))
+	hasTrailRescue := false
+	trIndex := -1
+	for i, dispatchMessage := range dispatchMessages.Messages {
+		if !CallIsTrailRescue(dispatchMessage.CallType) {
+			slog.Warn("call is not a trail rescue", slog.String("call_type", dispatchMessage.CallType), slog.String("transcription", tr.Transcription))
+			continue
+		}
+
+		slog.Info("trail rescue call detected", slog.String("call_type", dispatchMessage.CallType), slog.String("tac_channel", dispatchMessage.TACChannel), slog.Int("message_index", i+1))
+
+		hasTrailRescue = true
+		trIndex = i
+		break
+	}
+
+	if !hasTrailRescue {
+		slog.Warn("no trail rescue call found in dispatch messages")
 		return nil
 	}
+
+	if trIndex == -1 {
+		return fmt.Errorf("%w: %s", ErrFailedToParseDispatchMessage, "trail rescue index is -1")
+	}
+
+	dispatchMessage := dispatchMessages.Messages[trIndex]
 
 	slog.Info("trail rescue call detected", slog.String("call_type", dispatchMessage.CallType), slog.String("tac_channel", dispatchMessage.TACChannel))
 
