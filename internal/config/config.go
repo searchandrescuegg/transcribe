@@ -56,9 +56,10 @@ type Config struct {
 
 	TacticalChannelActivationDuration time.Duration `env:"TACTICAL_CHANNEL_ACTIVATION_DURATION" envDefault:"30m"` // Duration for which tactical channels are activated
 
-	SlackToken     string        `env:"SLACK_TOKEN"`
-	SlackChannelID string        `env:"SLACK_CHANNEL_ID"`
-	SlackTimeout   time.Duration `env:"SLACK_TIMEOUT" envDefault:"5s"` // Timeout for Slack API requests in seconds
+	SlackToken                        string        `env:"SLACK_TOKEN"`
+	SlackChannelID                    string        `env:"SLACK_CHANNEL_ID"`
+	SlackTimeout                      time.Duration `env:"SLACK_TIMEOUT" envDefault:"5s"` // Timeout for Slack API requests in seconds
+	SlackChannelClosedBroadcastEnabled bool         `env:"SLACK_CHANNEL_CLOSED_BROADCAST_ENABLED" envDefault:"false"` // Whether to broadcast channel closed messages
 
 	WorkerCount int `env:"WORKER_COUNT" envDefault:"5"`
 
