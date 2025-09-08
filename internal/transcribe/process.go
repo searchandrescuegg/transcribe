@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
+	"github.com/searchandrescuegg/transcribe/internal/ml"
 	"github.com/searchandrescuegg/transcribe/pkg/asr"
 	"github.com/slack-go/slack"
 )
@@ -30,11 +32,20 @@ func (tc *TranscribeClient) processDispatchCall(ctx context.Context, parsedKey *
 
 	hasTrailRescue := false
 	trIndex := -1
+	messageHashes := make(map[string]ml.DispatchMessage)
 	for i, dispatchMessage := range dispatchMessages.Messages {
 		if !CallIsTrailRescue(dispatchMessage.CallType) {
 			slog.Warn("call is not a trail rescue", slog.String("call_type", dispatchMessage.CallType), slog.String("transcription", tr.Transcription))
 			continue
 		}
+
+		hash := xxhash.Sum64([]byte(dispatchMessage.CleanedTranscription))
+
+		if _, exists := messageHashes[fmt.Sprintf("%d", hash)]; exists {
+			slog.Warn("duplicate dispatch message detected, skipping", slog.String("call_type", dispatchMessage.CallType), slog.String("tac_channel", dispatchMessage.TACChannel), slog.Int("message_index", i+1))
+			continue
+		}
+		messageHashes[fmt.Sprintf("%d", hash)] = dispatchMessage
 
 		slog.Info("trail rescue call detected", slog.String("call_type", dispatchMessage.CallType), slog.String("tac_channel", dispatchMessage.TACChannel), slog.Int("message_index", i+1))
 
