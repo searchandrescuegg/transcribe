@@ -139,12 +139,16 @@ func (tc *TranscribeClient) processDispatchCall(ctx context.Context, parsedKey *
 
 		sendMessageCtx, sendMessageCancel := context.WithTimeout(afterFuncCtx, tc.config.SlackTimeout)
 
-		_, _, _, err = tc.slackClient.SendMessageContext(sendMessageCtx, tc.config.SlackChannelID,
+		msgOptions := []slack.MsgOption{
 			slack.MsgOptionBlocks(BuildChannelClosedBlocks(&channelClosedInput)...),
 			slack.MsgOptionAsUser(true),
 			slack.MsgOptionTS(tsThread),
-			slack.MsgOptionBroadcast(),
-		)
+		}
+		if tc.config.SlackChannelClosedBroadcastEnabled {
+			msgOptions = append(msgOptions, slack.MsgOptionBroadcast())
+		}
+
+		_, _, _, err = tc.slackClient.SendMessageContext(sendMessageCtx, tc.config.SlackChannelID, msgOptions...)
 		if err != nil {
 			if retryErr := tc.handleSlackRateLimit(afterFuncCtx, err, parsedKey.dk.Talkgroup); retryErr != nil {
 				if errors.Is(retryErr, context.DeadlineExceeded) || errors.Is(retryErr, context.Canceled) {
