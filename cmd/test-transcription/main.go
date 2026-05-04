@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sashabaranov/go-openai"
+	"github.com/searchandrescuegg/transcribe/internal/calltypes"
 	openaiClient "github.com/searchandrescuegg/transcribe/internal/openai"
 )
 
@@ -35,12 +37,27 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Optional: same encrypted call-types file as the production binary, so local iteration
+	// exercises the same prompt + schema enum as prod.
+	var allowedCallTypes []string
+	if path := os.Getenv("CALL_TYPES_PATH"); path != "" {
+		loaded, err := calltypes.Load(path, os.Getenv("CALL_TYPES_KEY"))
+		if err != nil {
+			slog.Error("failed to load call-types file", slog.String("error", err.Error()))
+			os.Exit(1)
+		}
+		allowedCallTypes = loaded
+	}
+
 	openaiConfig := openai.DefaultConfig(apiKey)
 	openaiConfig.BaseURL = baseURL
 	openaiConfig.HTTPClient = &http.Client{Timeout: time.Second * 30}
+	// Mirror prod's default — thinking off for fast, deterministic responses.
 	mlClient := openaiClient.NewOpenAIClient(
 		openai.NewClientWithConfig(openaiConfig),
 		modelName,
+		allowedCallTypes,
+		false,
 	)
 
 	transcriptionBytes, err := os.ReadFile(transcriptionFile)
@@ -51,7 +68,7 @@ func main() {
 
 	transcription := string(transcriptionBytes)
 
-	message, err := mlClient.ParseRelevantInformationFromDispatchMessage(transcription)
+	message, err := mlClient.ParseRelevantInformationFromDispatchMessage(context.Background(), transcription)
 	if err != nil {
 		slog.Error("could not parse relevant information from dispatch message", slog.String("error", err.Error()))
 		os.Exit(1)

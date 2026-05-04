@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/cespare/xxhash/v2"
+	"github.com/searchandrescuegg/transcribe/internal/asr"
 	"github.com/searchandrescuegg/transcribe/internal/ml"
-	"github.com/searchandrescuegg/transcribe/pkg/asr"
 	"github.com/slack-go/slack"
 )
 
@@ -22,21 +22,8 @@ var (
 	ErrFailedToFindTalkgroup            = errors.New("failed to find talkgroup for tac channel")
 	ErrFailedToAddTalkgroupToAllowlist  = errors.New("failed to add talkgroup to allowed list")
 	ErrFailedToGetThreadIDFromDragonfly = errors.New("failed to get thread id from dragonfly")
+	ErrFailedToPostSlackMessage         = errors.New("failed to post slack message")
 )
-
-func (tc *TranscribeClient) handleSlackRateLimit(ctx context.Context, err error, talkgroup string) error {
-	var rateLimited *slack.RateLimitedError
-	if errors.As(err, &rateLimited) && rateLimited.Retryable() {
-		slog.Warn("slack rate limited, retrying", slog.String("error", err.Error()), slog.String("talkgroup", talkgroup))
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(rateLimited.RetryAfter):
-			return nil
-		}
-	}
-	return err
-}
 
 func selectTrailRescueMessage(dispatchMessages *ml.DispatchMessages, transcription string) (*ml.DispatchMessage, string) {
 	// Track message hashes to detect duplicates - stores all processed messages for deduplication
@@ -67,7 +54,8 @@ func selectTrailRescueMessage(dispatchMessages *ml.DispatchMessages, transcripti
 func (tc *TranscribeClient) processDispatchCall(ctx context.Context, parsedKey *AdornedDeconstructedKey, tr *asr.TranscriptionResponse) error {
 	slog.Debug("processing fire dispatch transcription", slog.String("talkgroup", parsedKey.dk.Talkgroup), slog.String("transcription", tr.Transcription))
 
-	dispatchMessages, err := tc.mlClient.ParseRelevantInformationFromDispatchMessage(tr.Transcription)
+	// FIX (review item #3): pass ctx through so worker timeout / shutdown actually cancels the LLM call.
+	dispatchMessages, err := tc.mlClient.ParseRelevantInformationFromDispatchMessage(ctx, tr.Transcription)
 	if err != nil {
 		return fmt.Errorf("%w: %s", ErrFailedToParseDispatchMessage, err.Error())
 	}
@@ -96,24 +84,21 @@ func (tc *TranscribeClient) processDispatchCall(ctx context.Context, parsedKey *
 
 	expiresAt := time.Now().Add(tc.config.TacticalChannelActivationDuration).Local()
 
-	sendMessageCtx, sendMessageCancel := context.WithTimeout(ctx, tc.config.SlackTimeout)
-
-	_, tsThread, _, err := tc.slackClient.SendMessageContext(sendMessageCtx, tc.config.SlackChannelID, slack.MsgOptionBlocks(BuildRescueTrailBlocks(&RescueTrailBlocksInput{
-		TACChannel:        dispatchMessage.TACChannel,
-		TranscriptionText: tr.Transcription,
-		ExpiresAt:         expiresAt,
-	})...))
+	// FIX (review item #1): sendSlackWithRetry actually retries after RetryAfter on 429s,
+	// where the previous handleSlackRateLimit waited and silently dropped the message.
+	// FIX (review item #1, follow-on): if the post fails entirely, we now bail out instead of
+	// continuing to schedule a TAC closure against an empty thread_ts.
+	tsThread, err := tc.sendSlackWithRetry(ctx, parsedKey.dk.Talkgroup,
+		slack.MsgOptionBlocks(BuildRescueTrailBlocks(&RescueTrailBlocksInput{
+			TACChannel:        dispatchMessage.TACChannel,
+			TranscriptionText: tr.Transcription,
+			ExpiresAt:         expiresAt,
+			DispatchTGID:      FireDispatch1TGID,
+			TACTalkgroupTGID:  tg.TGID, // enables the slackctl controller's Cancel/Extend buttons
+		})...))
 	if err != nil {
-		if retryErr := tc.handleSlackRateLimit(ctx, err, parsedKey.dk.Talkgroup); retryErr != nil {
-			if errors.Is(retryErr, context.DeadlineExceeded) || errors.Is(retryErr, context.Canceled) {
-				slog.Error("context done while waiting for rate limit retry", slog.String("error", retryErr.Error()), slog.String("talkgroup", parsedKey.dk.Talkgroup))
-			} else {
-				slog.Error("failed to post message to Slack", slog.String("error", err.Error()))
-			}
-			sendMessageCancel()
-		}
+		return fmt.Errorf("%w: %s", ErrFailedToPostSlackMessage, err.Error())
 	}
-	sendMessageCancel()
 
 	slog.Debug("posted message to slack", slog.String("tac_channel", dispatchMessage.TACChannel), slog.String("thread_id", tsThread))
 
@@ -124,47 +109,19 @@ func (tc *TranscribeClient) processDispatchCall(ctx context.Context, parsedKey *
 
 	slog.Debug("set TAC channel in Dragonfly", slog.String("tac_channel", dispatchMessage.TACChannel), slog.String("thread_id", tsThread))
 
-	time.AfterFunc(tc.config.TacticalChannelActivationDuration, func() {
-		// Create context with timeout for cleanup operation - independent of original context
-		// to ensure cleanup completes even if original request is cancelled
-		afterFuncCtx, afterFuncCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer afterFuncCancel()
-
-		slog.Debug("TAC channel expiration reached, posting channel closed message", slog.String("tac_channel", dispatchMessage.TACChannel))
-
-		channelClosedInput := ChannelClosedBlocksInput{
-			Channel:  dispatchMessage.TACChannel,
-			ClosedAt: time.Now().Local(),
-		}
-
-		sendMessageCtx, sendMessageCancel := context.WithTimeout(afterFuncCtx, tc.config.SlackTimeout)
-
-		msgOptions := []slack.MsgOption{
-			slack.MsgOptionBlocks(BuildChannelClosedBlocks(&channelClosedInput)...),
-			slack.MsgOptionAsUser(true),
-			slack.MsgOptionTS(tsThread),
-		}
-		if tc.config.SlackChannelClosedBroadcastEnabled {
-			msgOptions = append(msgOptions, slack.MsgOptionBroadcast())
-		}
-
-		_, _, _, err = tc.slackClient.SendMessageContext(sendMessageCtx, tc.config.SlackChannelID, msgOptions...)
-		if err != nil {
-			if retryErr := tc.handleSlackRateLimit(afterFuncCtx, err, parsedKey.dk.Talkgroup); retryErr != nil {
-				if errors.Is(retryErr, context.DeadlineExceeded) || errors.Is(retryErr, context.Canceled) {
-					slog.Error("context done while waiting for rate limit retry", slog.String("error", retryErr.Error()), slog.String("talkgroup", parsedKey.dk.Talkgroup))
-				} else {
-					slog.Error("failed to post channel closed message to Slack", slog.String("error", err.Error()), slog.String("tac_channel", dispatchMessage.TACChannel))
-				}
-				sendMessageCancel()
-				return
-			}
-		}
-		sendMessageCancel()
-
-		slog.Debug("posted channel closed message to Slack", slog.String("tac_channel", dispatchMessage.TACChannel), slog.String("thread_id", tsThread))
-	},
-	)
+	// FIX (review item #10 / option B): persisted ZSET entry replaces in-process time.AfterFunc.
+	// Previously a process restart would silently drop the scheduled "channel closed" Slack message;
+	// the sweeper goroutine now picks it up after restart based on the recorded expiry.
+	if err := tc.ScheduleTACClosure(ctx, ClosureMeta{
+		TGID:            tg.TGID,
+		TACChannel:      dispatchMessage.TACChannel,
+		ThreadTS:        tsThread,
+		SourceTalkgroup: parsedKey.dk.Talkgroup,
+		MessageTS:       tsThread, // alert is the thread parent; ts == thread_ts for chat.update later
+		Transcription:   tr.Transcription,
+	}, expiresAt); err != nil {
+		slog.Error("failed to persist TAC closure schedule", slog.String("error", err.Error()), slog.String("tac_channel", dispatchMessage.TACChannel))
+	}
 
 	return nil
 }
@@ -191,9 +148,9 @@ func (tc *TranscribeClient) processNonDispatchCall(ctx context.Context, parsedKe
 
 	slog.Debug("found talkgroup information", slog.String("talkgroup", parsedKey.dk.Talkgroup), slog.Any("talkgroup_info", tgInfo))
 
-	sendMessageCtx, sendMessageCancel := context.WithTimeout(ctx, tc.config.SlackTimeout)
-
-	_, _, _, err = tc.slackClient.SendMessageContext(sendMessageCtx, tc.config.SlackChannelID,
+	// FIX (review item #1): sendSlackWithRetry actually retries on rate limit; the prior path
+	// waited and discarded the message. Errors now propagate so Work() can Nack for redelivery.
+	if _, err := tc.sendSlackWithRetry(ctx, parsedKey.dk.Talkgroup,
 		slack.MsgOptionBlocks(BuildThreadCommunicationBlocks(&ThreadCommunicationBlocksInput{
 			Channel: tgInfo.FullName,
 			Message: tr.Transcription,
@@ -201,21 +158,17 @@ func (tc *TranscribeClient) processNonDispatchCall(ctx context.Context, parsedKe
 		})...),
 		slack.MsgOptionAsUser(true),
 		slack.MsgOptionTS(tsThread),
-	)
-	if err != nil {
-		if retryErr := tc.handleSlackRateLimit(ctx, err, parsedKey.dk.Talkgroup); retryErr != nil {
-			if errors.Is(retryErr, context.DeadlineExceeded) || errors.Is(retryErr, context.Canceled) {
-				slog.Error("context done while waiting for rate limit retry", slog.String("error", retryErr.Error()), slog.String("talkgroup", parsedKey.dk.Talkgroup))
-				sendMessageCancel()
-				return retryErr
-			} else {
-				slog.Error("failed to post transcription message to Slack", slog.String("error", err.Error()))
-				sendMessageCancel()
-			}
-		}
+	); err != nil {
+		return fmt.Errorf("%w: %s", ErrFailedToPostSlackMessage, err.Error())
 	}
-	sendMessageCancel()
 
 	slog.Debug("posted transcription message to Slack", slog.String("talkgroup", parsedKey.dk.Talkgroup), slog.String("thread_id", tsThread))
+
+	// Roll the rescue's live interpretation forward. Best-effort and decoupled — if the
+	// LLM call or chat.update fails we still consider the TAC transmission processed (the
+	// per-message thread reply above is the canonical record). Uses parsedKey.dk.Time as
+	// the capture moment so the model sees stable timestamps even when pipeline latency
+	// varies between transmissions.
+	tc.updateLiveInterpretation(ctx, parsedKey.dk.Talkgroup, parsedKey.dk.Time, tr.Transcription)
 	return nil
 }

@@ -1,0 +1,92 @@
+# yamllint disable rule:line-length
+# Slack app manifest for the transcribe service.
+#
+# How to use this file
+# ─────────────────────
+#
+#   1. Go to https://api.slack.com/apps and click "Create New App".
+#   2. Choose "From an app manifest" → pick your workspace → paste the YAML below
+#      (everything from `_metadata:` onward — Slack ignores the comment block).
+#   3. Review the auto-generated app and click "Create".
+#   4. Install the app to your workspace from the "Install App" sidebar item.
+#      Copy the **Bot User OAuth Token** (xoxb-...) into `SLACK_TOKEN` in your `.env`.
+#   5. Generate the App-Level Token (this CANNOT be expressed in a manifest):
+#        Basic Information → "App-Level Tokens" → "Generate Token and Scopes" →
+#        add the `connections:write` scope → Generate.
+#      Copy the resulting xapp-... value into `SLACK_APP_TOKEN` in your `.env`.
+#   6. Invite the bot to your alert channel:
+#        /invite @transcribe       (or whatever you renamed the bot to)
+#   7. Copy the alert channel's ID (channel details → Copy channel ID) into
+#      `SLACK_CHANNEL_ID` in your `.env`.
+#   8. (Optional) For the Cancel / Extend buttons, set `SLACK_ALLOWED_USER_IDS` to
+#      a comma-separated list of Slack user IDs (UXXXXXX). Anyone not on the list
+#      gets an ephemeral "not authorized" reply when they click.
+#
+# Updating an existing app
+# ────────────────────────
+#
+# If you already have an app and want to apply this manifest to it:
+#   App settings → "App Manifest" → replace the YAML → "Save Changes".
+# Slack will warn you about scope diffs and prompt for re-installation if needed.
+# Re-installation issues a NEW xoxb- token; update SLACK_TOKEN in .env afterwards.
+---
+_metadata:
+  major_version: 1
+  minor_version: 1
+
+display_information:
+  name: Transcribe
+  description: Radio communication monitoring for trail rescue dispatches.
+  long_description: |
+    Transcribe monitors NORCOM Fire Department radio dispatch channels, automatically
+    detects trail rescue calls via AI analysis of transcripts, and posts notifications
+    to a configured Slack channel. When leadership presses Cancel (False Alarm) or
+    Extend monitoring on an alert, the service updates Dragonfly state and posts a
+    confirmation in the rescue thread.
+  background_color: "#1f4e3a"
+
+features:
+  bot_user:
+    display_name: Transcribe
+    always_online: true
+  app_home:
+    # The bot doesn't render a Home tab; disable it so users aren't confused by an
+    # empty "About" surface. messages_tab_read_only_enabled keeps the DM tab visible
+    # but read-only, which matches "this is an outbound bot, not a chatbot".
+    home_tab_enabled: false
+    messages_tab_enabled: false
+    messages_tab_read_only_enabled: true
+
+oauth_config:
+  scopes:
+    bot:
+      # chat:write — post the rescue alert, post follow-up TAC transmissions in
+      # thread, post cancellation/extension confirmations in thread, and chat.update
+      # the original alert message when leadership cancels.
+      - chat:write
+      # chat:write.public — allow posting to public channels without explicit invite.
+      # The bot only posts to one channel (SLACK_CHANNEL_ID), so this is convenience
+      # rather than necessity. Drop it if you prefer the bot be a member of every
+      # channel it touches.
+      - chat:write.public
+
+settings:
+  org_deploy_enabled: false
+  # Socket Mode is the transport for interactivity events (button clicks). With it
+  # on, the bot opens an outbound WebSocket to Slack rather than receiving HTTP
+  # POSTs — so no public ingress is required.
+  #
+  # The companion App-Level Token (xapp-..., scope `connections:write`) is NOT
+  # defined in this manifest; you generate it once via the UI after creating the
+  # app — see the comment block at the top of this file.
+  socket_mode_enabled: true
+  token_rotation_enabled: false
+  interactivity:
+    # No request_url is needed because Socket Mode delivers the events. If you
+    # ever switch off Socket Mode, you'll need to add an `request_url` here that
+    # points at a public endpoint backed by the service.
+    is_enabled: true
+  event_subscriptions:
+    # No event subscriptions: the bot never reacts to messages, member joins,
+    # reactions, etc. It only handles interactivity (button clicks).
+    bot_events: []
