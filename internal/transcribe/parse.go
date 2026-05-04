@@ -27,6 +27,11 @@ func parseKey(key string) (*DeconstructedKey, error) {
 	suffix := initialParts[1]
 
 	tg := strings.Split(initialParts[0], "-")
+	// FIX (review item #4): bounds-check before indexing tg[1]; a malformed key with no dash
+	// (e.g. "1399.foo.wav") previously panicked the worker.
+	if len(tg) < 2 {
+		return nil, fmt.Errorf("invalid talkgroup-timestamp format: %s", initialParts[0])
+	}
 	talkgroup := tg[0] // The talkgroup is the first part before the dash
 
 	tsfreq := tg[1] // The second part contains the timestamp and frequency

@@ -8,6 +8,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -17,9 +18,17 @@ type ASRClient struct {
 	defaultTimeout time.Duration
 }
 
+// TranscriptionResponse mirrors the JSON the production ASR (parakeet-tdt) returns. The
+// field name `text` (not `transcription`) was the cluster's actual choice; an earlier
+// version of this struct used `transcription` and silently dropped every transcript on the
+// floor because json.Unmarshal couldn't find the field.
+//
+// NoSpeechDetected is included so callers can distinguish "audio contained no speech"
+// (a radio squelch click, a brief tone) from "ASR errored": the former is normal and
+// should not push the message to the DLQ.
 type TranscriptionResponse struct {
-	Transcription string `json:"transcription"`
-	Filename      string `json:"filename"`
+	Transcription    string `json:"text"`
+	NoSpeechDetected bool   `json:"no_speech_detected"`
 }
 
 func NewASRClient(endpoint string, defaultTimeout time.Duration) *ASRClient {
@@ -68,7 +77,11 @@ func (c *ASRClient) Transcribe(ctx context.Context, fileName string, fileContent
 	}()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		// Surface the response body so 4xx/5xx errors are debuggable from the worker logs
+		// instead of just a bare status code. Truncate to a sane size so the log line stays
+		// readable even when the upstream returns a large HTML error page.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, fmt.Errorf("ASR returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
 	var transcriptionResp TranscriptionResponse

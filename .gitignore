@@ -15,3 +15,16 @@
 vendor/
 
 .env
+
+# Plaintext call-types files: only the encrypted .enc form should be committed.
+# Operators decrypt locally to a *.txt under config/ and re-encrypt before committing.
+config/call_types.txt
+config/*.calltypes.txt
+
+.calltypes.key
+
+# s3-ninja metadata sidecars. The container writes a `$<key>.properties` file alongside
+# every served object — operational state, not source. Leave $version tracked since it
+# represents the bucket layout version that the test fixtures depend on.
+docker/s3ninja/audio/$*.wav.properties
+docker/s3ninja/audio/$*.m4a.properties

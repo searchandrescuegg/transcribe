@@ -12,45 +12,53 @@ services:
         condition: service_started
       mock-asr:
         condition: service_started
+      dragonfly:
+        condition: service_started
+    # Operator-supplied secrets and tunables are loaded from .env. The file is gitignored
+    # and may not exist on a fresh clone; required: false makes that case non-fatal so
+    # `docker compose config` and `docker compose up` still work for someone exploring the
+    # repo. Real deployments should populate .env (copy from .env.example).
+    env_file:
+      - path: .env
+        required: false
+    # The `environment:` block runs AFTER `env_file:` and overrides anything in it. Use
+    # this for values that MUST be these — internal hostnames inside the docker network.
     environment:
-      # logging
-      LOG_LEVEL: "info"
-
-      # metrics
-      METRICS_ENABLED: "true"
-      METRICS_PORT: "8081"
-
+      # signals to main.go that we're in compose-land (use OTLP exporter, not Prometheus)
       LOCAL: "true"
 
-      # tracing
-      TRACING_ENABLED: "false"
-      TRACING_SAMPLERATE: "1.0"
-      TRACING_SERVICE: "transcribe"
-      TRACING_VERSION: "0.0.1"
+      # tracing destination (operator decides whether to enable via TRACING_ENABLED in .env)
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://lgtm:4317"
+      TRACING_SERVICE: "transcribe"
+      TRACING_VERSION: "0.0.1-local"
 
-      # grpc (otlp tracing)
-      # GRPC_GO_LOG_VERBOSITY_LEVEL: 99
-      # GRPC_GO_LOG_SEVERITY_LEVEL: info
-
-      # pulsar configuration
+      # pulsar — pinned to the internal broker + the topics created by pulsar-init
       PULSAR_URL: "pulsar://pulsar:6650"
       PULSAR_INPUT_TOPIC: "public/transcribe/file-queue"
-      PULSAR_OUTPUT_TOPIC: "public/transcribe/transcription-results"
       PULSAR_SUBSCRIPTION: "transcribe-consumer"
+      PULSAR_DLQ_TOPIC: "public/transcribe/file-queue-dlq"
 
-      # s3 configuration
+      # s3 — pinned to s3-ninja. The example AWS keys here are not secrets; s3-ninja
+      # accepts any credentials. Real deployments override S3_* via .env.
       S3_REGION: "us-east-1"
       S3_BUCKET: "audio"
-      AWS_ACCESS_KEY_ID: "AKIAIOSFODNN7EXAMPLE"
-      AWS_SECRET_ACCESS_KEY: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
-      S3_ENDPOINT: "http://s3ninja:9444"
+      S3_ACCESS_KEY: "AKIAIOSFODNN7EXAMPLE"
+      S3_SECRET_KEY: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+      # s3-ninja listens on port 9000 inside the container; host port 9444 (in the
+      # service definition below) is just for browser access from the host. Inside the
+      # docker network we have to use the container port.
+      S3_ENDPOINT: "http://s3ninja:9000"
 
-      # target endpoint
-      TARGET_ENDPOINT: "http://mock-asr:1080/transcribe"
+      # ASR_ENDPOINT is intentionally NOT pinned here. The active value comes from .env so
+      # operators can flip between the local mock-asr container and the real cluster ASR
+      # without editing this file. Default in .env is http://mock-asr:1080/transcribe.
 
-      # worker configuration
-      WORKER_COUNT: "3"
+      # dragonfly — pinned to the internal service below
+      DRAGONFLY_ADDRESS: "dragonfly:6379"
+    volumes:
+      # Read-only mount so CALL_TYPES_PATH=/config/call_types.enc resolves at runtime when
+      # the operator has authored an encrypted file under ./config/.
+      - ./config:/config:ro
 
   pulsar:
     image: apachepulsar/pulsar:4.0.2
@@ -83,6 +91,9 @@ services:
         echo 'Creating output topic...'
         bin/pulsar-admin --admin-url=http://pulsar:8080 topics create-partitioned-topic public/transcribe/transcription-results -p 4 || echo 'Output topic may already exist'
 
+        echo 'Creating DLQ topic...'
+        bin/pulsar-admin --admin-url=http://pulsar:8080 topics create-partitioned-topic public/transcribe/file-queue-dlq -p 4 || echo 'DLQ topic may already exist'
+
         echo 'Pulsar initialization completed successfully'
       "
     depends_on:
@@ -107,6 +118,16 @@ services:
     volumes:
       - ./docker/mock-asr:/config
     command: -logLevel INFO -serverPort 1080
+
+  # Dragonfly speaks the Redis protocol; the transcribe service uses it for the
+  # allowed_talkgroups set, the per-talkgroup tg:<TGID> routing keys, the active_tacs
+  # ZSET (TAC closure schedule), and the dedup:<S3-key> guards.
+  dragonfly:
+    image: docker.dragonflydb.io/dragonflydb/dragonfly:latest
+    ports:
+      - "6379:6379"
+    ulimits:
+      memlock: -1
 
   lgtm:
     image: grafana/otel-lgtm

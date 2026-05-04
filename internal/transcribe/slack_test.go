@@ -23,6 +23,7 @@ func TestBuildRescueTrailBlocks(t *testing.T) {
 		TACChannel:        tacChannel,
 		TranscriptionText: transcriptionText,
 		ExpiresAt:         expiresAt,
+		DispatchTGID:      transcribe.FireDispatch1TGID,
 	})
 
 	jsonBlocks, err := json.Marshal(blocks)

@@ -38,29 +38,44 @@ func (tc *TranscribeClient) IsObjectAllowed(ctx context.Context, key string) (bo
 	}
 
 	isAllowed := res[0]
-	if isAllowed || parsedKey.Talkgroup == "1399" { // Always allow fire dispatch, needed to enable tactical channels later on
+	// Always allow fire dispatch through; we need its transcripts to detect trail rescues
+	// and enable the tactical channels.
+	if isAllowed || parsedKey.Talkgroup == FireDispatch1TGID {
 		return true, adk, nil
 	}
 
-	return false, nil, nil
+	// Return the parsed key on rejection too — the caller's nack-recovery path needs the
+	// talkgroup to log meaningfully, and there's no information leak in giving back what's
+	// already in the filename. The boolean false is the dispositive signal.
+	return false, adk, nil
 }
 
+// FIX (review item #7): the prior rule (levenshtein <= 2 against "trail" only) accepted
+// "tail", "rail", "trial", "frail", and any other 5-letter word within two edits, with no
+// "rescue" context required. That's a false-positive risk for the only Slack alert this
+// service emits. The new rule:
+//   - Fast-path: literal substring match for both "trail" AND "rescue".
+//   - Fuzzy fallback: tightened to distance <= 1 (covers single-character ASR typos like
+//     "trails"/"fescue") AND requires both a near-trail and a near-rescue token, so a
+//     stray word can't trigger an alert on its own.
 func CallIsTrailRescue(calltype string) bool {
 	calltype = strings.ToLower(calltype)
 
-	// Check for exact trail match first
-	if strings.Contains(calltype, "trail") {
+	if strings.Contains(calltype, "trail") && strings.Contains(calltype, "rescue") {
 		return true
 	}
 
-	// Fuzzy match for trail with levenshtein distance
-	words := strings.Fields(calltype)
-	for _, word := range words {
-		// Allow up to 2 character differences for trail matching
-		if levenshtein.ComputeDistance(word, "trail") <= 2 {
+	hasTrail, hasRescue := false, false
+	for _, word := range strings.Fields(calltype) {
+		if !hasTrail && levenshtein.ComputeDistance(word, "trail") <= 1 {
+			hasTrail = true
+		}
+		if !hasRescue && levenshtein.ComputeDistance(word, "rescue") <= 1 {
+			hasRescue = true
+		}
+		if hasTrail && hasRescue {
 			return true
 		}
 	}
-
 	return false
 }
