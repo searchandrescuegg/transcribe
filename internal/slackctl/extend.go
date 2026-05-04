@@ -46,7 +46,7 @@ func (c *Controller) ExtendTAC(ctx context.Context, tgid string) (newExpiry time
 	// Refresh the routing key with the same thread_ts and the new TTL. Set is unconditional
 	// so we don't need a GET first; the value we want is already in meta.ThreadTS.
 	if err := c.dfly.Set(ctx, fmt.Sprintf(tgRoutingKeyFmt, tgid), dur, meta.ThreadTS); err != nil {
-		return time.Time{}, meta, false, fmt.Errorf("Set tg:<TGID>: %w", err)
+		return time.Time{}, meta, false, fmt.Errorf("set tg:<TGID>: %w", err)
 	}
 	if err := c.dfly.ZAdd(ctx, activeTACsKey, float64(newExpiry.Unix()), tgid); err != nil {
 		return time.Time{}, meta, false, fmt.Errorf("ZAdd active_tacs: %w", err)

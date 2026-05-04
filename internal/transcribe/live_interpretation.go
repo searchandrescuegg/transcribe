@@ -151,7 +151,7 @@ func (tc *TranscribeClient) appendTranscript(ctx context.Context, listKey string
 		return fmt.Errorf("RPush: %w", err)
 	}
 	if err := tc.dragonflyClient.Expire(ctx, listKey, listTTL); err != nil {
-		return fmt.Errorf("Expire: %w", err)
+		return fmt.Errorf("expire: %w", err)
 	}
 	return nil
 }

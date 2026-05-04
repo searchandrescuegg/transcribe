@@ -66,7 +66,7 @@ func (c *Controller) CancelTAC(ctx context.Context, tgid string) (meta transcrib
 		return meta, false, fmt.Errorf("SRem allowed_talkgroups: %w", err)
 	}
 	if err := c.dfly.Del(ctx, fmt.Sprintf(tgRoutingKeyFmt, tgid)); err != nil {
-		return meta, false, fmt.Errorf("Del tg:<TGID>: %w", err)
+		return meta, false, fmt.Errorf("del tg:<TGID>: %w", err)
 	}
 	if _, err := c.dfly.ZRem(ctx, activeTACsKey, tgid); err != nil {
 		return meta, false, fmt.Errorf("ZRem active_tacs: %w", err)
@@ -79,7 +79,7 @@ func (c *Controller) CancelTAC(ctx context.Context, tgid string) (meta transcrib
 		fmt.Sprintf(summaryStaleKeyFmt, tgid),
 		fmt.Sprintf(summaryDataKeyFmt, tgid),
 	); err != nil {
-		return meta, false, fmt.Errorf("Del closure sidecars: %w", err)
+		return meta, false, fmt.Errorf("del closure sidecars: %w", err)
 	}
 	return meta, true, nil
 }
@@ -87,7 +87,7 @@ func (c *Controller) CancelTAC(ctx context.Context, tgid string) (meta transcrib
 func (c *Controller) readClosureMeta(ctx context.Context, tgid string) (transcribe.ClosureMeta, bool, error) {
 	raw, err := c.dfly.Get(ctx, fmt.Sprintf(tacMetaKeyFmt, tgid))
 	if err != nil {
-		return transcribe.ClosureMeta{}, false, fmt.Errorf("Get tac_meta:<TGID>: %w", err)
+		return transcribe.ClosureMeta{}, false, fmt.Errorf("get tac_meta:<TGID>: %w", err)
 	}
 	if raw == "" {
 		return transcribe.ClosureMeta{}, false, nil

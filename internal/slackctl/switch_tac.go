@@ -77,7 +77,7 @@ func (c *Controller) SwitchTAC(ctx context.Context, oldTGID, newTGID string) (ne
 		return transcribe.ClosureMeta{}, time.Time{}, false, fmt.Errorf("SAddEx new allowed: %w", err)
 	}
 	if err := c.dfly.Set(ctx, fmt.Sprintf(tgRoutingKeyFmt, newTGID), dur, oldMeta.ThreadTS); err != nil {
-		return transcribe.ClosureMeta{}, time.Time{}, false, fmt.Errorf("Set new routing: %w", err)
+		return transcribe.ClosureMeta{}, time.Time{}, false, fmt.Errorf("set new routing: %w", err)
 	}
 
 	// Now tear down the old state.
@@ -85,7 +85,7 @@ func (c *Controller) SwitchTAC(ctx context.Context, oldTGID, newTGID string) (ne
 		return transcribe.ClosureMeta{}, time.Time{}, false, fmt.Errorf("SRem old allowed: %w", err)
 	}
 	if err := c.dfly.Del(ctx, fmt.Sprintf(tgRoutingKeyFmt, oldTGID)); err != nil {
-		return transcribe.ClosureMeta{}, time.Time{}, false, fmt.Errorf("Del old routing: %w", err)
+		return transcribe.ClosureMeta{}, time.Time{}, false, fmt.Errorf("del old routing: %w", err)
 	}
 	if _, err := c.dfly.ZRem(ctx, activeTACsKey, oldTGID); err != nil {
 		return transcribe.ClosureMeta{}, time.Time{}, false, fmt.Errorf("ZRem old closure: %w", err)
@@ -98,7 +98,7 @@ func (c *Controller) SwitchTAC(ctx context.Context, oldTGID, newTGID string) (ne
 		fmt.Sprintf(summaryStaleKeyFmt, oldTGID),
 		fmt.Sprintf(summaryDataKeyFmt, oldTGID),
 	); err != nil {
-		return transcribe.ClosureMeta{}, time.Time{}, false, fmt.Errorf("Del old closure sidecars: %w", err)
+		return transcribe.ClosureMeta{}, time.Time{}, false, fmt.Errorf("del old closure sidecars: %w", err)
 	}
 	return newMeta, newExpiry, true, nil
 }

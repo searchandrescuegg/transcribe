@@ -839,7 +839,7 @@ func (s *DispatchSuite) TestProcessRecord_DispatchEventSetsInFlightMarker() {
 		// recover from the nil-deref panic at S3 fetch — the call sequence is
 		// processRecord → tc.s3Client.GetFile, which panics on a nil s3Client. Catching
 		// the panic lets us assert state without standing up a real S3 mock just for this.
-		recover()
+		_ = recover()
 	}()
 	_ = tc.processRecord(s.ctx, record)
 
