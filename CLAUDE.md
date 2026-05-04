@@ -61,42 +61,50 @@ Each was discovered (and fixed) during development; comments in code reference t
    `WorkerTimeout` window then nack-loops chasing an allow-list write that won't happen.
    (`processRecord`)
 
-3. **Sweeper sidecar cleanup MUST run AFTER `postChannelClosed`, not before** — otherwise
+3. **`dispatch_in_flight` marker MUST be cleared on processRecord exit** — a deferred
+   `Del` runs immediately after the `Set`, so success, error, non-rescue, and panic paths
+   all reach it. Without the defer, a 1399 dispatch that the LLM classifies as anything
+   other than a trail rescue (Smoke - Burn Complaint, Aid Emergency, etc.) leaves the
+   marker set for the full `WorkerTimeout` window — every concurrent TAC transmission
+   nacks-for-retry against a phantom dispatch and eventually DLQs. The TTL is a safety
+   net; the deferred `Del` is authoritative. (`processRecord`)
+
+4. **Sweeper sidecar cleanup MUST run AFTER `postChannelClosed`, not before** — otherwise
    `summary_data:<TGID>` is deleted before `buildFeedbackURL` reads it, and the feedback
    form silently loses the headline + situation_summary prefill. The cleanup uses an
    inline `cleanup()` closure called explicitly on every exit path. (`sweepOnce` in
    `sweeper.go`)
 
-4. **`IsObjectAllowed` returns the parsed key on rejection** — the nack-recovery error
+5. **`IsObjectAllowed` returns the parsed key on rejection** — the nack-recovery error
    message in `processRecord` reads `parsedKey.dk.Talkgroup`. If `IsObjectAllowed` returns
    nil parsed-key, this nil-derefs. (`rules.go`)
 
-5. **Cancel / Switch / sweeper close MUST clean up ALL sidecars**: `tac_meta:<TGID>`,
+6. **Cancel / Switch / sweeper close MUST clean up ALL sidecars**: `tac_meta:<TGID>`,
    `tac_transcripts:<TGID>`, `summary_ts:<TGID>`, `summary_lock:<TGID>`,
    `summary_stale:<TGID>`, `summary_data:<TGID>`, `tg:<TGID>`, plus SREM from
    `allowed_talkgroups` and ZREM from `active_tacs`. Missing one = a closed-then-reopened
    rescue inherits stale state from the prior incident. (`sweeper.go`, `slackctl/cancel.go`,
    `slackctl/switch_tac.go`)
 
-6. **`WorkerTimeout >= OpenAITimeout`** — the worker context wraps the LLM round-trip;
+7. **`WorkerTimeout >= OpenAITimeout`** — the worker context wraps the LLM round-trip;
    if it cancels first, the LLM call gets canceled before it can answer. Currently 180s vs
    120s in `.env`. (`internal/config/config.go`)
 
-7. **`time.Local` override happens BEFORE any time-formatting code runs** — set in
+8. **`time.Local` override happens BEFORE any time-formatting code runs** — set in
    `main.go` immediately after config + slog are wired. Tests that depend on display
    format set `time.Local` themselves (see `slack_test.go`). The binary embeds Go's
    tzdata via `_ "time/tzdata"` import so distroless-static can resolve any IANA zone.
 
-8. **URL buttons in Slack still fire `block_actions` events** — they need a no-op case in
+9. **URL buttons in Slack still fire `block_actions` events** — they need a no-op case in
    the controller dispatch (`ActionIDFeedbackForm`) or the dispatch logs a noisy
    `unknown action_id` WARN on every click. (`internal/slackctl/controller.go`)
 
-9. **The ASR response field is `text`, not `transcription`** — the cluster ASR returns
-   `{"text": "..."}` while the old mock returned `{"transcription": "..."}`. The struct in
-   `internal/asr/client.go` uses `json:"text"`. If you ever swap ASR backends, this is
-   the first thing to check.
+10. **The ASR response field is `text`, not `transcription`** — the cluster ASR returns
+    `{"text": "..."}` while the old mock returned `{"transcription": "..."}`. The struct in
+    `internal/asr/client.go` uses `json:"text"`. If you ever swap ASR backends, this is
+    the first thing to check.
 
-10. **`SLACK_ALLOWED_USER_IDS=*` short-circuits the leadership gate** — the empty-list
+11. **`SLACK_ALLOWED_USER_IDS=*` short-circuits the leadership gate** — the empty-list
     behavior is "deny all" (safe default); `*` is "allow all" (intentional choice, logged
     at WARN). Don't accidentally make empty-list mean "allow all". (`slackctl/controller.go`)
 

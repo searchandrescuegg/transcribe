@@ -240,6 +240,18 @@ func (tc *TranscribeClient) processRecord(ctx context.Context, record *s3event.E
 		if err := tc.dragonflyClient.Set(ctx, dispatchInFlightKey, tc.config.WorkerTimeout, "1"); err != nil {
 			slog.Warn("failed to set dispatch_in_flight marker; racing TAC events will not recover", slog.String("error", err.Error()))
 		}
+		// FIX (dispatch_in_flight cleanup): clear the marker on exit — success, error,
+		// non-rescue, or panic. Without this, a non-rescue dispatch (e.g. the LLM classifies
+		// as "Smoke - Burn Complaint" or any other non-trail-rescue type) leaves the marker
+		// set for the full WorkerTimeout window with no allow-list write coming. Every TAC
+		// transmission during that window then nacks-for-retry chasing a recovery that
+		// never happens, eventually DLQ'ing them all. The TTL is a safety net only — the
+		// authoritative clear is here.
+		defer func() {
+			if err := tc.dragonflyClient.Del(ctx, dispatchInFlightKey); err != nil {
+				slog.Warn("failed to clear dispatch_in_flight marker", slog.String("error", err.Error()))
+			}
+		}()
 	}
 
 	fileBytes, err := tc.s3Client.GetFile(ctx, key)
