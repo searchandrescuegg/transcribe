@@ -94,6 +94,13 @@ func TestDispatchSuite(t *testing.T) {
 func (s *DispatchSuite) SetupSuite() {
 	s.ctx = context.Background()
 
+	// CLAUDE.md invariant #7: tests that depend on display formatting set time.Local
+	// themselves. CI containers default to UTC, but feedback_test asserts a PDT-formatted
+	// "MST"-suffixed string, so pin the suite to America/Los_Angeles.
+	loc, err := time.LoadLocation("America/Los_Angeles")
+	s.Require().NoError(err, "load America/Los_Angeles (binary embeds time/tzdata)")
+	time.Local = loc
+
 	// Dragonfly speaks the Redis protocol; we use the canonical image so the suite tests the
 	// same product running in prod (not a redis-server stand-in that may diverge on edge cases).
 	dfReq := testcontainers.ContainerRequest{
