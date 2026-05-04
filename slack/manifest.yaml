@@ -1,3 +1,4 @@
+# yamllint disable rule:line-length
 # Slack app manifest for the transcribe service.
 #
 # How to use this file
@@ -28,7 +29,7 @@
 #   App settings → "App Manifest" → replace the YAML → "Save Changes".
 # Slack will warn you about scope diffs and prompt for re-installation if needed.
 # Re-installation issues a NEW xoxb- token; update SLACK_TOKEN in .env afterwards.
-
+---
 _metadata:
   major_version: 1
   minor_version: 1
