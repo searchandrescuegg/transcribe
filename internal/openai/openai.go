@@ -192,7 +192,10 @@ func (oc *OpenAIClient) buildSchema() (*jsonschema.Definition, error) {
 	enum = append(enum, oc.allowedCallTypes...)
 	enum = append(enum, unknownCallType)
 
-	// schema.Properties["messages"].Items.Properties["call_type"]
+	// Walk to messages[].call_type. As of go-openai v1.41+, GenerateSchemaForType
+	// emits a `$ref` into a `$defs` table for nested struct types instead of inlining
+	// Properties on Items. Resolve the ref so the enum patches the right node — and
+	// keep the legacy inline path so older library versions still work.
 	messagesProp, ok := schema.Properties["messages"]
 	if !ok {
 		return nil, fmt.Errorf("schema missing expected `messages` property; library shape changed?")
@@ -200,6 +203,23 @@ func (oc *OpenAIClient) buildSchema() (*jsonschema.Definition, error) {
 	if messagesProp.Items == nil {
 		return nil, fmt.Errorf("schema `messages` has no Items definition; library shape changed?")
 	}
+
+	const dispatchMessageRef = "#/$defs/DispatchMessage"
+	if messagesProp.Items.Ref == dispatchMessageRef {
+		def, ok := schema.Defs["DispatchMessage"]
+		if !ok {
+			return nil, fmt.Errorf("schema `$defs.DispatchMessage` not found; library shape changed?")
+		}
+		callType, ok := def.Properties["call_type"]
+		if !ok {
+			return nil, fmt.Errorf("schema `$defs.DispatchMessage.call_type` not found; library shape changed?")
+		}
+		callType.Enum = enum
+		def.Properties["call_type"] = callType
+		schema.Defs["DispatchMessage"] = def
+		return schema, nil
+	}
+
 	callType, ok := messagesProp.Items.Properties["call_type"]
 	if !ok {
 		return nil, fmt.Errorf("schema `messages.call_type` not found; library shape changed?")
