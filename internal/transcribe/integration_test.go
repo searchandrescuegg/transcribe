@@ -814,17 +814,22 @@ func (s *DispatchSuite) TestProcessRecord_DispatchDedupHit_DoesNotSetInFlightMar
 	slackMock.AssertNotCalled(s.T(), "SendMessageContext", mock.Anything, mock.Anything, mock.Anything)
 }
 
-// FIX (dispatch-in-flight nack recovery): processing a Fire Dispatch event must set the
-// in-flight marker before any other work, so concurrent TAC events can read it and recover.
-func (s *DispatchSuite) TestProcessRecord_DispatchEventSetsInFlightMarker() {
+// FIX (dispatch_in_flight cleanup): processRecord defers a clear of the marker so it
+// is always cleaned up after the dispatch path completes, regardless of outcome. This
+// pins the regression where a non-rescue dispatch (e.g. the LLM classifies as
+// "Smoke - Burn Complaint") left the marker set for the full WorkerTimeout window,
+// causing every concurrent TAC transmission to nack-loop chasing an allow-list write
+// that was never going to happen.
+//
+// The test exercises the panic-during-S3-fetch path (nil s3Client). Defers fire during
+// panic unwind, so the marker should be cleared even though processRecord didn't return
+// cleanly — that's the same property that protects us against unexpected panics in
+// production code paths.
+func (s *DispatchSuite) TestProcessRecord_DispatchPath_ClearsInFlightOnExit() {
 	slackMock := new(mockSlackPoster)
 	mlMock := new(mockMLClient)
 	tc := s.newClientUnderTest(slackMock, mlMock)
 
-	// Mock the rest of the dispatch path so processRecord can reach the end without
-	// genuinely fetching/transcribing. The S3 client is nil in the test client, so we don't
-	// pretend to make an S3 call work — instead we'll only reach the marker-set step before
-	// the S3 fetch fails. That's enough to verify the marker is set.
 	record := &s3event.EventRecord{
 		EventName: s3event.EventObjectCreatedPut,
 		S3: s3event.EventS3Data{
@@ -832,21 +837,18 @@ func (s *DispatchSuite) TestProcessRecord_DispatchEventSetsInFlightMarker() {
 		},
 	}
 
-	// Fire processRecord — it will set the marker, then fail at the S3 fetch (because the
-	// test client has nil s3Client). We don't care about the failure; we only assert the
-	// marker is set as a side-effect of the early dispatch path.
-	defer func() {
-		// recover from the nil-deref panic at S3 fetch — the call sequence is
-		// processRecord → tc.s3Client.GetFile, which panics on a nil s3Client. Catching
-		// the panic lets us assert state without standing up a real S3 mock just for this.
-		_ = recover()
+	// processRecord sets the marker, then panics at the nil s3Client. The deferred clear
+	// in processRecord runs during panic unwind; we recover here to assert post-state.
+	func() {
+		defer func() { _ = recover() }()
+		_ = tc.processRecord(s.ctx, record)
 	}()
-	_ = tc.processRecord(s.ctx, record)
 
-	val, err := s.rdb.Get(s.ctx, dispatchInFlightKey).Result()
-	s.Require().NoError(err, "dispatch_in_flight key must be set after a 1399 event reaches processRecord")
-	s.Equal("1", val)
+	exists, err := s.rdb.Exists(s.ctx, dispatchInFlightKey).Result()
+	s.Require().NoError(err)
+	s.EqualValues(0, exists, "dispatch_in_flight must be cleared by processRecord's defer, even on panic-unwind")
 }
+
 
 // ============================================================================
 // handleMessage: 3 cases (uses the Pulsar container for real ack/nack lifecycle)
