@@ -135,11 +135,12 @@ visible at both layers).
 
 ## Slack interactivity model
 
-Three buttons + one URL button on every rescue alert (when `SLACK_APP_TOKEN` is configured):
+Four buttons + one URL button on every rescue alert (when `SLACK_APP_TOKEN` is configured):
 
 | Action ID | Type | Authorized? | Effect |
 |---|---|---|---|
-| `rescue_cancel` | Button (danger) + confirm | Yes (allowlist) | SREM allow-list, DEL all sidecars, post cancellation reply, chat.update alert to "Cancelled" |
+| `rescue_cancel` | Button (danger) + confirm | Yes (allowlist) | SREM allow-list, DEL all sidecars, post cancellation reply, chat.update alert to "Cancelled" — wipes summary context |
+| `rescue_close` | Button + confirm | Yes (allowlist) | Early end-of-rescue routed through the **same path as auto-expiry**: SREM allow-list + DEL routing inline (so TAC traffic stops immediately), then ZADD `active_tacs` with score=now-1 so the sweeper claims it on its next tick (~5s) and runs `postChannelClosed` + `updateAlertForClosure` (preserving `summary_data` for the feedback URL prefill) + sidecar cleanup |
 | `rescue_extend` | Button + confirm | Yes (allowlist) | Refresh all per-TGID TTLs to a fresh activation window |
 | `rescue_switch_tac` | Static-select + confirm | Yes (allowlist) | Migrate state from old TGID to new TGID; preserve thread_ts |
 | `feedback_form` | URL button (closed alert only) | n/a | Opens Google Form client-side; controller no-ops the resulting `block_actions` event |
