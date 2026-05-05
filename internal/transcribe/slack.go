@@ -46,7 +46,13 @@ type RescueTrailBlocksInput struct {
 // Action IDs are the routing keys the slackctl controller dispatches on. Keep these in
 // sync with internal/slackctl/controller.go.
 const (
-	ActionIDRescueCancel    = "rescue_cancel"
+	ActionIDRescueCancel = "rescue_cancel"
+	// ActionIDRescueClose ends the rescue early but routes through the same path the
+	// auto-expiry sweeper takes — distinct from Cancel (false-alarm), which wipes the
+	// alert + summary context. Close preserves the structured Live Interpretation,
+	// rewrites the parent alert with the Submit Feedback button, and posts a normal
+	// "Channel Closed" reply, identical to a natural expiry.
+	ActionIDRescueClose     = "rescue_close"
 	ActionIDRescueExtend    = "rescue_extend"
 	ActionIDRescueSwitchTAC = "rescue_switch_tac"
 	// ActionIDFeedbackForm is the action_id on the URL-style Submit Feedback button.
@@ -216,6 +222,18 @@ func buildRescueActionsBlock(tacChannel, tacTGID string) slack.Block {
 		slack.NewTextBlockObject(slack.PlainTextType, "Keep monitoring", false, false),
 	)
 
+	closeBtn := slack.NewButtonBlockElement(
+		ActionIDRescueClose,
+		tacTGID,
+		slack.NewTextBlockObject(slack.PlainTextType, "Close (End Rescue)", true, false),
+	)
+	closeBtn.Confirm = slack.NewConfirmationBlockObject(
+		slack.NewTextBlockObject(slack.PlainTextType, fmt.Sprintf("Close %s monitoring?", tacChannel), false, false),
+		slack.NewTextBlockObject(slack.PlainTextType, "Ends the rescue early. The Live Interpretation summary, dispatch context, and Submit Feedback button are preserved — same as a natural auto-close.", false, false),
+		slack.NewTextBlockObject(slack.PlainTextType, "Close monitoring", false, false),
+		slack.NewTextBlockObject(slack.PlainTextType, "Keep monitoring", false, false),
+	)
+
 	extendBtn := slack.NewButtonBlockElement(
 		ActionIDRescueExtend,
 		tacTGID,
@@ -232,7 +250,7 @@ func buildRescueActionsBlock(tacChannel, tacTGID string) slack.Block {
 
 	// block_id encodes the active TGID so the switch handler knows what to migrate FROM.
 	blockID := fmt.Sprintf("%s:%s", ActionsBlockIDPrefix, tacTGID)
-	return slack.NewActionBlock(blockID, cancelBtn, extendBtn, switchSelect)
+	return slack.NewActionBlock(blockID, cancelBtn, closeBtn, extendBtn, switchSelect)
 }
 
 // buildSwitchTACSelect returns a static_select populated with TAC1-TAC10. Each option's

@@ -138,6 +138,8 @@ func (c *Controller) dispatch(evt *socketmode.Event, client *socketmode.Client) 
 		switch action.ActionID {
 		case transcribe.ActionIDRescueCancel:
 			c.handleCancel(ctx, payload, action)
+		case transcribe.ActionIDRescueClose:
+			c.handleClose(ctx, payload, action)
 		case transcribe.ActionIDRescueExtend:
 			c.handleExtend(ctx, payload, action)
 		case transcribe.ActionIDRescueSwitchTAC:

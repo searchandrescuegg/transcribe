@@ -297,6 +297,63 @@ func TestParseOldTGIDFromBlockID(t *testing.T) {
 }
 
 // ============================================================================
+// CloseTAC
+// ============================================================================
+
+func (s *SlackctlSuite) TestCloseTAC_TriggersSweeperAndPreservesContext() {
+	s.preloadActiveTAC("1389", "TAC1", "ts-rescue-1")
+
+	// Sidecars the sweeper preserves through the close path. summary_data in particular
+	// is read by the feedback URL builder during the parent-alert rewrite — premature
+	// deletion (the way Cancel does it) would silently strip the prefill.
+	s.Require().NoError(s.dfly.Set(s.ctx, fmt.Sprintf(summaryDataKeyFmt, "1389"), 30*time.Minute, `{"headline":"hiker fall","situation_summary":"x"}`))
+	s.Require().NoError(s.dfly.Set(s.ctx, fmt.Sprintf(summaryTSKeyFmt, "1389"), 30*time.Minute, "ts-summary-1"))
+
+	meta, ok, err := s.controller.CloseTAC(s.ctx, "1389")
+	s.Require().NoError(err)
+	s.True(ok)
+	s.Equal("TAC1", meta.TACChannel)
+	s.Equal("ts-rescue-1", meta.ThreadTS)
+
+	// Routing cut off immediately so further TAC traffic doesn't leak through during the
+	// sweeper-tick lag (the per-member SADDEX TTL would otherwise outlive the click).
+	mem, err := s.rdb.SIsMember(s.ctx, allowedTalkgroupsKey, "1389").Result()
+	s.Require().NoError(err)
+	s.False(mem, "1389 must be removed from allowed_talkgroups immediately")
+	exists, err := s.rdb.Exists(s.ctx, fmt.Sprintf(tgRoutingKeyFmt, "1389")).Result()
+	s.Require().NoError(err)
+	s.EqualValues(0, exists, "tg:1389 must be deleted immediately")
+
+	// active_tacs entry now has a past score → sweeper claims it on its next tick.
+	score, err := s.rdb.ZScore(s.ctx, activeTACsKey, "1389").Result()
+	s.Require().NoError(err)
+	s.LessOrEqual(score, float64(time.Now().Unix()), "score must be in the past for the sweeper to claim it")
+
+	// Sidecars MUST survive — sweeper owns these deletions, and the feedback URL builder
+	// reads summary_data:<TGID> when it rewrites the parent alert.
+	exists, err = s.rdb.Exists(s.ctx, fmt.Sprintf(tacMetaKeyFmt, "1389")).Result()
+	s.Require().NoError(err)
+	s.EqualValues(1, exists, "tac_meta:1389 must survive — sweeper reads it to post Channel Closed")
+	exists, err = s.rdb.Exists(s.ctx, fmt.Sprintf(summaryDataKeyFmt, "1389")).Result()
+	s.Require().NoError(err)
+	s.EqualValues(1, exists, "summary_data:1389 must survive — feedback URL builder reads it")
+	exists, err = s.rdb.Exists(s.ctx, fmt.Sprintf(summaryTSKeyFmt, "1389")).Result()
+	s.Require().NoError(err)
+	s.EqualValues(1, exists, "summary_ts:1389 must survive until sweeper cleanup")
+}
+
+func (s *SlackctlSuite) TestCloseTAC_AlreadyExpired_ReturnsNotOk() {
+	_, ok, err := s.controller.CloseTAC(s.ctx, "1389")
+	s.Require().NoError(err)
+	s.False(ok, "no metadata means the TAC is no longer active; caller surfaces 'no longer active'")
+}
+
+func (s *SlackctlSuite) TestCloseTAC_EmptyTGID_ReturnsError() {
+	_, _, err := s.controller.CloseTAC(s.ctx, "")
+	s.Require().Error(err)
+}
+
+// ============================================================================
 // Authorization
 // ============================================================================
 
