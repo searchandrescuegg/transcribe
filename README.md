@@ -3,7 +3,7 @@
   transcribe
 </h2>
 <h2 align="center">
-  Radio-traffic monitoring for trail rescue: real-time transcription, AI-driven dispatch detection, live incident summarization, and Slack-native operator controls.
+  Radio-traffic monitoring: real-time transcription, AI-driven dispatch detection, live incident summarization, and Slack-native operator controls.
 </h2>
 <div align="center">
 
@@ -33,14 +33,14 @@ feedback button opens a Google Form prefilled with the incident context.
    filename's talkgroup.
 2. **Keyword detection** — Transcripts go through an OpenAI-compatible
    LLM with structured output, optionally constrained to a confidential call-types
-   enum. When the model identifies a trail rescue, the assigned tactical channel
-   (TAC1–TAC10) is auto-allow-listed for monitoring.
-3. **Slack alert with operator controls** — leadership sees the rescue alert with three
+   enum. When the model identifies a keyword, the assigned channel
+   is auto-allow-listed for monitoring.
+4. **Slack alert with operator controls** — leadership sees the alert with three
    actions wired through Socket Mode: **Cancel** (false alarm), **Extend** (push the
    auto-close out), and **Switch TAC** (correct the LLM if it picked the wrong channel).
    All three are scoped to a configured user-ID allowlist.
-4. **Live incident interpretation** — every transmission triggers a structured
-   summarization (headline, situation summary, key events, etc.) that updates a
+5. **Live incident interpretation** — every transmission triggers a structured
+   summarization (headline, situation summary, key events, etc...) that updates a
    single thread message in place. Cumulative context: each refresh sees the full
    ordered transcript history.
 6. **Auto-close lifecycle** — at expiry, the parent alert rewrites itself to a closed
