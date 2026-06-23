@@ -17,13 +17,11 @@
 
 ## Overview
 
-`transcribe` watches NORCOM Fire Department radio traffic, identifies trail rescue
-operations within seconds of dispatch, and posts a Slack alert with everything leadership
-needs to act on. As the rescue plays out on a tactical channel, the service keeps a live
-AI-generated interpretation of the situation in the rescue thread — updated after every
-new TAC transmission with cumulative context — and lets authorized leadership control the
+`transcribe` listens to radio traffic, identifies key words within seconds, and posts a Slack notification with the contents. As the rescue plays out on a channel, the service keeps a live
+AI-generated interpretation of the situation in the thread — updated after every
+new transmission with cumulative context — and lets authorized users control the
 incident from Slack itself (cancel a false alarm, extend monitoring, or correct the AI's
-TAC pick).
+channel pick).
 
 When the auto-close fires, the alert is rewritten in place to a closed state and a
 feedback button opens a Google Form prefilled with the incident context.
@@ -33,7 +31,7 @@ feedback button opens a Google Form prefilled with the incident context.
 1. **Real-time radio transcription** — WAV files land in S3, the service picks them up via
    Pulsar, ships them to an ASR endpoint, and decides what to do based on the
    filename's talkgroup.
-2. **Trail-rescue detection** — Fire Dispatch transcripts go through an OpenAI-compatible
+2. **Keyword detection** — Transcripts go through an OpenAI-compatible
    LLM with structured output, optionally constrained to a confidential call-types
    enum. When the model identifies a trail rescue, the assigned tactical channel
    (TAC1–TAC10) is auto-allow-listed for monitoring.
@@ -41,19 +39,19 @@ feedback button opens a Google Form prefilled with the incident context.
    actions wired through Socket Mode: **Cancel** (false alarm), **Extend** (push the
    auto-close out), and **Switch TAC** (correct the LLM if it picked the wrong channel).
    All three are scoped to a configured user-ID allowlist.
-4. **Live incident interpretation** — every TAC transmission triggers a structured
-   summarization (headline, situation summary, location, units, patient status, outcome,
-   key events) that updates a single thread message in place. Cumulative context: each
-   refresh sees the full ordered transcript history.
-5. **Auto-close lifecycle** — at expiry, the parent alert rewrites itself to a closed
+4. **Live incident interpretation** — every transmission triggers a structured
+   summarization (headline, situation summary, key events, etc.) that updates a
+   single thread message in place. Cumulative context: each refresh sees the full
+   ordered transcript history.
+6. **Auto-close lifecycle** — at expiry, the parent alert rewrites itself to a closed
    state (no buttons, status line replaced), a "Channel Closed" thread reply lands, and
-   a Submit Feedback button optionally opens a Google Form prefilled with TAC, closed-at,
-   dispatch transcript, and the latest AI summary.
-6. **Resilient under burst & failure** — durable closure scheduling via a Dragonfly
+   a Submit Feedback button optionally opens a Google Form prefilled with channel, closed-at,
+   transcript, and the latest AI summary.
+7. **Resilient under burst & failure** — durable closure scheduling via a Dragonfly
    sweeper (survives restarts), Pulsar DLQ for poison messages, dispatch-in-flight
-   nack-recovery for racing TAC traffic, per-TGID lock so concurrent transmissions don't
+   nack-recovery for racing traffic, per-TGID lock so concurrent transmissions don't
    stampede the LLM.
-7. **Observability** — structured slog (Pacific timezone by default), Prometheus metrics,
+8. **Observability** — structured slog (Pacific timezone by default), Prometheus metrics,
    OpenTelemetry traces wired to the local Grafana LGTM stack.
 
 <details>
@@ -70,13 +68,13 @@ flowchart TD
     E -->|Yes| F[Allow-list check]
 
     F -->|Dispatch 1399| G[Mark dispatch in-flight]
-    F -->|Allowed TAC| TAC[Process TAC<br/>transmission]
+    F -->|Allowed TAC| TAC[Process<br/>transmission]
     F -->|Not allowed,<br/>dispatch in-flight| RETRY[Nack → Pulsar redelivers]
     F -->|Not allowed,<br/>no dispatch| ACK[Ack & drop]
 
     G --> H[ASR + LLM<br/>structured parse]
-    H --> I{Trail rescue?}
-    I -->|Yes| J[Allow-list TAC,<br/>schedule auto-close]
+    H --> I{Keyword?}
+    I -->|Yes| J[Allow-list,<br/>schedule auto-close]
     I -->|No| L[Log, ack]
     J --> K[Slack alert<br/>+ Cancel / Extend / Switch]
 
@@ -183,7 +181,7 @@ Go's `tzdata` so distroless-static can resolve any IANA zone without a system zo
 Set to `UTC` (or `Europe/London`, etc.) if you operate elsewhere; empty leaves the
 container's default TZ in place.
 
-#### Confidential call types (optional)
+#### Additional call types (optional)
 
 The dispatch parser can be constrained to an operator-supplied list of call types via an
 AES-256-GCM-encrypted file. When `CALL_TYPES_PATH` is set the service decrypts the file
@@ -219,12 +217,11 @@ button on the closed alert:
 | --- | --- |
 | **Cancel (False Alarm)** | SREMs the talkgroup from the allow-list, deletes the routing key + pending closure + live-interpretation sidecars, posts a cancellation notice in the thread, rewrites the alert to "Cancelled" so the actions can't be re-pressed. |
 | **Extend monitoring** | Refreshes all per-TGID TTLs by another full activation window. Posts new expiry in the thread. |
-| **Switch TAC** | Static-select dropdown of TAC1–TAC10. Migrates allow-list / routing / closure / live-interpretation state from old TGID to new with a fresh activation window; preserves the original thread. Useful when the LLM picked the wrong channel. |
+| **Switch Channel** | Static-select dropdown of additional channels. Migrates allow-list / routing / closure / live-interpretation state from old TGID to new with a fresh activation window; preserves the original thread. Useful when the LLM picked the wrong channel. |
 | **Submit Feedback** *(closed alerts only)* | URL button opening a Google Form prefilled with TAC channel, closed-at, dispatch transcript, latest headline, latest situation summary. |
 
-All destructive actions require a confirmation dialog — fat-fingering during a real
-rescue has real consequences. All actions are scoped to `SLACK_ALLOWED_USER_IDS`;
-unauthorized presses get an ephemeral "restricted to incident leadership" reply with the
+All destructive actions require a confirmation dialog. All actions are scoped to `SLACK_ALLOWED_USER_IDS`;
+unauthorized presses get an ephemeral "restricted to authorized users" reply with the
 attempt logged for audit.
 
 The bot uses [Socket Mode](https://api.slack.com/apis/socket-mode), so it opens an
@@ -251,7 +248,7 @@ actions row.
 
 #### Live interpretation
 
-Every TAC transmission appends to `tac_transcripts:<TGID>` and triggers a structured
+Every transmission appends to `tac_transcripts:<TGID>` and triggers a structured
 summarization call (headline, situation summary, location, units involved, patient
 status, outcome, key events). The first transmission posts a single "Live Interpretation"
 message in the rescue thread; subsequent transmissions `chat.update` that same message in
@@ -259,7 +256,7 @@ place. Each refresh sees the full ordered transcript history, so the headline an
 narrative tighten up as the rescue plays out.
 
 Concurrency: a per-TGID `summary_lock` ensures only one LLM call runs at a time per
-rescue, even if multiple TAC transmissions arrive within a single LLM round-trip. Losers
+rescue, even if multiple transmissions arrive within a single LLM round-trip. Losers
 mark the rescue stale and the lock-holder runs a single catch-up pass that captures every
 transcript that piled up.
 
