@@ -17,7 +17,20 @@ type DeconstructedKey struct {
 
 // example key: "1183-1750542445_854412500.1-call_1871.wav"
 // components: "<talkgroup>-<timestamp>_<frequency>.<suffix>.<filetype>"
+//
+// FIX (prefixed-key regression): trunk-recorder now uploads objects under a
+// "YYYY/MM/DD/HH/<talkgroup>/" prefix (homelab c5e064d) instead of the bucket root.
+// The parser has always operated on the bare filename — with a prefix present,
+// "<talkgroup>-..." was preceded by the path, so tg[0] became the whole prefix
+// (e.g. "2026/07/05/19/1967/1967") rather than the talkgroup. That parsed without
+// error, so every object silently missed the allow-list (and never matched the
+// FireDispatch1TGID), causing all traffic to be ack-and-dropped. Reduce to the
+// basename first so both the flat and prefixed layouts parse identically.
 func parseKey(key string) (*DeconstructedKey, error) {
+	if idx := strings.LastIndexByte(key, '/'); idx != -1 {
+		key = key[idx+1:]
+	}
+
 	initialParts := strings.Split(key, ".")
 	if len(initialParts) != 3 {
 		return nil, fmt.Errorf("invalid key format: %s", key)
