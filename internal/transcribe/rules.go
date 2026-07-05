@@ -3,6 +3,8 @@ package transcribe
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"strconv"
 	"strings"
 
 	"github.com/agnivade/levenshtein"
@@ -19,6 +21,18 @@ func (tc *TranscribeClient) IsObjectAllowed(ctx context.Context, key string) (bo
 	parsedKey, err := parseKey(key)
 	if err != nil {
 		return false, nil, fmt.Errorf("failed to parse key: %w", err)
+	}
+
+	// Canary for key-format drift. A real talkgroup is always numeric; anything else means
+	// the filename didn't parse the way the roster maps expect (e.g. an upload-path prefix
+	// leaking into the talkgroup, as happened when trunk-recorder moved to date/talkgroup
+	// prefixes). Such an object can never match the roster or the allow-list, so it is
+	// ack-and-dropped below at DEBUG — but that drop is otherwise invisible. Surface it at
+	// WARN so a silent, drop-everything regression can't recur unnoticed. Legitimate
+	// off-roster traffic is still numeric and stays silent.
+	if _, convErr := strconv.Atoi(parsedKey.Talkgroup); convErr != nil {
+		slog.Warn("object key parsed to a non-numeric talkgroup; dropping (possible key-format drift)",
+			slog.String("parsed_talkgroup", parsedKey.Talkgroup), slog.String("key", key))
 	}
 
 	talkgroupInfo := talkgroupFromTGID[parsedKey.Talkgroup]
