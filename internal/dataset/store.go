@@ -9,9 +9,17 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	_ "github.com/jackc/pgx/v5/stdlib" // database/sql driver "pgx"
 	"github.com/pressly/goose/v3"
 )
+
+// pingMaxElapsedTime bounds how long NewStore retries the initial Postgres connection. The
+// dataset DB (a CloudNativePG cluster) can take up to ~90s to have ready endpoints on a fresh
+// rollout, and dialing its ClusterIP before then fails fast (EPERM under IPVS kube-proxy). We
+// retry across that window; if the DB is still unreachable after this, it's a genuine problem and
+// the error propagates so it surfaces (main exits → CrashLoopBackOff) rather than being hidden.
+const pingMaxElapsedTime = 3 * time.Minute
 
 //go:embed migrations/*.sql
 var embedMigrations embed.FS
@@ -43,9 +51,7 @@ func NewStore(ctx context.Context, dsn string, bufferSize int) (*Store, error) {
 		return nil, fmt.Errorf("open postgres: %w", err)
 	}
 
-	pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	if err := db.PingContext(pingCtx); err != nil {
+	if err := pingWithBackoff(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
@@ -65,6 +71,33 @@ func NewStore(ctx context.Context, dsn string, bufferSize int) (*Store, error) {
 	s.wg.Add(1)
 	go s.run()
 	return s, nil
+}
+
+// pingWithBackoff verifies connectivity with exponential backoff, retrying transient failures
+// (notably the fresh-rollout race where the CNPG Postgres has no ready endpoints yet) instead of
+// failing the whole service on the first blip. Every failed attempt logs a WARN so the retries are
+// visible; it gives up after pingMaxElapsedTime (or when ctx is cancelled), returning the last
+// error so a persistent problem is surfaced rather than silently swallowed.
+func pingWithBackoff(ctx context.Context, db *sql.DB) error {
+	bo := backoff.NewExponentialBackOff()
+	bo.InitialInterval = 1 * time.Second
+	bo.MaxInterval = 10 * time.Second
+	bo.MaxElapsedTime = pingMaxElapsedTime
+
+	attempt := 0
+	op := func() error {
+		attempt++
+		pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		return db.PingContext(pingCtx)
+	}
+	notify := func(err error, next time.Duration) {
+		slog.Warn("dataset: postgres not reachable yet, retrying",
+			slog.String("error", err.Error()),
+			slog.Int("attempt", attempt),
+			slog.Duration("retry_in", next))
+	}
+	return backoff.RetryNotify(op, backoff.WithContext(bo, ctx), notify)
 }
 
 func runMigrations(db *sql.DB) error {

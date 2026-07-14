@@ -2,8 +2,10 @@ package dataset
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/searchandrescuegg/transcribe/internal/ml"
 	"github.com/stretchr/testify/assert"
@@ -110,4 +112,23 @@ func TestRecordingMLClient_Cleanup_RecordsCleanupKind(t *testing.T) {
 	assert.Equal(t, "claude-haiku-4-5", got.Model, "cleanup is recorded under the cleanup model")
 	assert.Contains(t, got.InputText, "norwell hill trail", "input records the built cleanup prompt")
 	assert.NotNil(t, got.Output)
+}
+
+// pingWithBackoff must abort promptly when the context is cancelled (shutdown), not keep retrying
+// for the full pingMaxElapsedTime — otherwise a shutdown mid-startup would hang for minutes.
+func TestPingWithBackoff_RespectsCanceledContext(t *testing.T) {
+	// Valid DSN shape, nothing listening on port 1 — PingContext fails fast.
+	db, err := sql.Open("pgx", "postgres://u:p@127.0.0.1:1/db")
+	require.NoError(t, err)
+	defer db.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled before we start
+
+	start := time.Now()
+	err = pingWithBackoff(ctx, db)
+	elapsed := time.Since(start)
+
+	require.Error(t, err, "unreachable DB with a cancelled ctx must return an error")
+	assert.Less(t, elapsed, 5*time.Second, "must give up promptly on cancelled ctx, not retry for pingMaxElapsedTime")
 }
