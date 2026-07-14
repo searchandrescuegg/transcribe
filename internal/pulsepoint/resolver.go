@@ -113,7 +113,11 @@ func (r *Resolver) ResolveForRescue(ctx context.Context, dispatchText string, re
 	callCtx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
 
-	resp, err := r.client.Incidents.List(callCtx, r.agencyID, &pulpo.IncidentListOptions{})
+	// Both:true (the `both=1` query param) is REQUIRED. Without it the PulsePoint feed returns a
+	// flat `{"incidents":[]}` array that does NOT unmarshal into the bucketed {alerts,active,recent}
+	// shape pulpo expects, so List silently yields nothing. With it we get the buckets and read
+	// Active (in-progress incidents); Recent holds closed calls we don't need.
+	resp, err := r.client.Incidents.List(callCtx, r.agencyID, &pulpo.IncidentListOptions{Both: true})
 	if err != nil {
 		return UnitContext{}, err
 	}
