@@ -108,10 +108,16 @@ type Config struct {
 	// pipeline. PulpoBaseURL, PulpoAPIKey, and PulpoAgencyID are required when enabled.
 	// PulpoRefreshInterval doubles as the TTL of the per-rescue cached unit block, so the roster
 	// self-refreshes as units are added over the life of the incident.
+	//
+	// PulpoUsername / PulpoPassword are the HTTP Basic auth credentials the PulsePoint API
+	// requires in addition to the apikey. Optional here (some deployments front the API without
+	// Basic auth); when both are set the client sends them, so leave them empty to skip Basic auth.
 	PulpoEnabled         bool          `env:"PULPO_ENABLED" envDefault:"false"`
 	PulpoBaseURL         string        `env:"PULPO_BASE_URL"`
 	PulpoAPIKey          string        `env:"PULPO_API_KEY"`
 	PulpoAgencyID        string        `env:"PULPO_AGENCY_ID"`
+	PulpoUsername        string        `env:"PULPO_USERNAME"`
+	PulpoPassword        string        `env:"PULPO_PASSWORD"`
 	PulpoTimeout         time.Duration `env:"PULPO_TIMEOUT" envDefault:"5s"`
 	PulpoRefreshInterval time.Duration `env:"PULPO_REFRESH_INTERVAL" envDefault:"45s"`
 

@@ -261,6 +261,8 @@ func main() {
 			BaseURL:  c.PulpoBaseURL,
 			APIKey:   c.PulpoAPIKey,
 			AgencyID: c.PulpoAgencyID,
+			Username: c.PulpoUsername,
+			Password: c.PulpoPassword,
 			Timeout:  c.PulpoTimeout,
 		})
 		slog.Info("PulsePoint unit enrichment enabled", slog.String("agency_id", c.PulpoAgencyID))

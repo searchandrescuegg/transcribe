@@ -24,6 +24,10 @@ type Options struct {
 	BaseURL  string
 	APIKey   string
 	AgencyID string
+	// Username / Password are the HTTP Basic auth credentials the PulsePoint API requires
+	// alongside the apikey. When both are non-empty the client sends them; leave empty to skip.
+	Username string
+	Password string
 	// Timeout bounds each CAD round-trip independently of the caller's context so a slow feed
 	// can't eat the worker budget. Zero uses a 5s default.
 	Timeout time.Duration
@@ -63,11 +67,18 @@ func NewResolver(opts Options) *Resolver {
 		timeout = defaultTimeout
 	}
 
-	client, err := pulpo.NewClient(
+	clientOpts := []pulpo.Option{
 		pulpo.WithBaseURL(opts.BaseURL),
 		pulpo.WithAPIKey(opts.APIKey),
 		pulpo.WithHTTPClient(&http.Client{Timeout: timeout}),
-	)
+	}
+	// PulsePoint gates the API behind Basic auth in addition to the apikey; send it when both
+	// credentials are present.
+	if opts.Username != "" && opts.Password != "" {
+		clientOpts = append(clientOpts, pulpo.WithBasicAuth(opts.Username, opts.Password))
+	}
+
+	client, err := pulpo.NewClient(clientOpts...)
 	if err != nil {
 		// Construction only fails on empty base URL / API key, both validated upstream. Fall back
 		// to a nil client; RescueUnitBlock guards on it and returns empty context.
