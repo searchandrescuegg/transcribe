@@ -120,7 +120,7 @@ func TestPingWithBackoff_RespectsCanceledContext(t *testing.T) {
 	// Valid DSN shape, nothing listening on port 1 — PingContext fails fast.
 	db, err := sql.Open("pgx", "postgres://u:p@127.0.0.1:1/db")
 	require.NoError(t, err)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // already cancelled before we start
