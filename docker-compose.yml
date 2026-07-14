@@ -14,6 +14,8 @@ services:
         condition: service_started
       dragonfly:
         condition: service_started
+      postgres:
+        condition: service_healthy
     # Operator-supplied secrets and tunables are loaded from .env. The file is gitignored
     # and may not exist on a fresh clone; required: false makes that case non-fatal so
     # `docker compose config` and `docker compose up` still work for someone exploring the
@@ -55,6 +57,10 @@ services:
 
       # dragonfly — pinned to the internal service below
       DRAGONFLY_ADDRESS: "dragonfly:6379"
+
+      # postgres — dataset capture target. Only used when DATASET_ENABLED=true (set in .env);
+      # migrations run automatically at startup.
+      DATASET_POSTGRES_URL: "postgres://transcribe:transcribe@postgres:5432/transcribe?sslmode=disable"
     volumes:
       # Read-only mount so CALL_TYPES_PATH=/config/call_types.enc resolves at runtime when
       # the operator has authored an encrypted file under ./config/.
@@ -129,6 +135,24 @@ services:
     ulimits:
       memlock: -1
 
+  # Postgres backs the optional dataset capture (DATASET_ENABLED). The transcribe service
+  # applies its own goose migrations at startup, so no init SQL is mounted here.
+  postgres:
+    image: postgres:17-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: transcribe
+      POSTGRES_PASSWORD: transcribe
+      POSTGRES_DB: transcribe
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U transcribe -d transcribe"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
   lgtm:
     image: grafana/otel-lgtm
     ports:
@@ -145,3 +169,4 @@ services:
 
 volumes:
   pulsar_data:
+  postgres_data:

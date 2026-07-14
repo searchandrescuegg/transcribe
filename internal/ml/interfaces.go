@@ -34,6 +34,40 @@ type RescueSummaryInput struct {
 	DispatchCallType      string // "Rescue - Trail", etc. — what the dispatch parser already extracted
 	TACChannel            string // "TAC10", etc.
 	TACTranscripts        []TACTranscript
+
+	// PreviousSummary is the summary produced on the last pass, if any. When set, the model is
+	// told to EXTEND it (preserve established KeyEvents, append new ones) rather than re-derive
+	// the narrative from scratch — this keeps the live interpretation additive so key events
+	// stop churning between transmissions. Nil on the first pass (or when the prior summary
+	// couldn't be read), in which case the summarizer behaves exactly as before.
+	PreviousSummary *RescueSummary
+
+	// UnitContext is an optional rendered block describing the units currently assigned to the
+	// call (from the CAD / PulsePoint feed). Empty when the enrichment is disabled or unavailable;
+	// when present it lets the model correct garbled unit callsigns to their canonical form.
+	UnitContext string
+}
+
+// TACCleanupInput carries one raw TAC transmission plus the surrounding context the model uses
+// to clean it up. DispatchContext anchors what incident this is; UnitContext (optional) lets the
+// model pin garbled unit callsigns to real assigned units.
+type TACCleanupInput struct {
+	Text            string // raw ASR transcription of this TAC transmission
+	DispatchContext string // the dispatch transcription that started the rescue
+	UnitContext     string // rendered CAD unit block; empty when unavailable
+}
+
+// TACCleanupResult is the structured-output wrapper for a cleaned transmission. A struct (rather
+// than a bare string) keeps the response schema-constrained and consistent with the other ML
+// calls.
+type TACCleanupResult struct {
+	CleanedText string `json:"cleaned_text"`
+}
+
+// TranscriptCleaner rewrites a single raw TAC transmission into a clean, faithful transcription
+// (fixing ASR errors, place names, and unit callsigns) without inventing information.
+type TranscriptCleaner interface {
+	CleanTACTranscript(ctx context.Context, in TACCleanupInput) (*TACCleanupResult, error)
 }
 
 // RescueSummary is the structured wrap-up for a rescue. Each field is independently
@@ -62,6 +96,12 @@ type RescueSummary struct {
 	// Outcome is the disposition of the call: "Resolved — patient transported", "Cancelled
 	// en route", "False alarm", "Ongoing", etc. The model picks from observed cues.
 	Outcome string `json:"outcome"`
+
+	// SARNotified is true when the TAC chatter clearly indicates Search and Rescue has been
+	// notified / requested / contacted / is responding (phrasing varies widely). Surfaced as a
+	// green-check badge on the alert and in the live interpretation. Latched on the alert: once
+	// a rescue trips this, the parent alert is badged and stays badged.
+	SARNotified bool `json:"sar_notified"`
 
 	// KeyEvents is a chronological list of notable moments. CapturedAt mirrors the input
 	// transcript timestamp; Description is a short sentence.

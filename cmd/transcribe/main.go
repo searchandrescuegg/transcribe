@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 	// Embeds Go's tzdata in the binary so time.LoadLocation works on distroless-static
@@ -17,13 +18,16 @@ import (
 	"alpineworks.io/ootel"
 	"github.com/redis/go-redis/v9"
 	openai "github.com/sashabaranov/go-openai"
+	anthropicClient "github.com/searchandrescuegg/transcribe/internal/anthropic"
 	"github.com/searchandrescuegg/transcribe/internal/asr"
 	"github.com/searchandrescuegg/transcribe/internal/calltypes"
 	"github.com/searchandrescuegg/transcribe/internal/config"
+	"github.com/searchandrescuegg/transcribe/internal/dataset"
 	"github.com/searchandrescuegg/transcribe/internal/dragonfly"
 	"github.com/searchandrescuegg/transcribe/internal/logging"
 	openaiClient "github.com/searchandrescuegg/transcribe/internal/openai"
 	"github.com/searchandrescuegg/transcribe/internal/pulsar"
+	"github.com/searchandrescuegg/transcribe/internal/pulsepoint"
 	"github.com/searchandrescuegg/transcribe/internal/s3"
 	"github.com/searchandrescuegg/transcribe/internal/slackctl"
 	"github.com/searchandrescuegg/transcribe/internal/transcribe"
@@ -152,25 +156,84 @@ func main() {
 		slog.Info("CALL_TYPES_PATH not set; running without call-type enum constraint")
 	}
 
-	// The OpenAI client is the only ML backend; Ollama (and other local servers like vLLM /
-	// LiteLLM) are still usable by pointing OPENAI_BASE_URL at their /v1-compatible endpoint.
-	slog.Info("initializing OpenAI ML backend", slog.String("model", c.OpenAIModel), slog.String("base_url", c.OpenAIBaseURL))
-	if c.OpenAIAPIKey == "" {
-		slog.Warn("OpenAI API key not provided - this may be required depending on your endpoint configuration")
+	// ML backend selection. Both the OpenAI-compatible path (also usable with Ollama / vLLM /
+	// LiteLLM via OPENAI_BASE_URL) and the first-party Anthropic path implement
+	// transcribe.MLClient (= DispatchMessageParser + RescueSummarizer); ML_BACKEND picks one
+	// at startup.
+	var mlClient transcribe.MLClient
+	switch strings.ToLower(c.MLBackend) {
+	case "anthropic":
+		slog.Info("initializing Anthropic ML backend",
+			slog.String("dispatch_model", c.AnthropicDispatchModel),
+			slog.String("summary_model", c.AnthropicSummaryModel))
+		if c.AnthropicAPIKey == "" {
+			slog.Error("ML_BACKEND=anthropic requires ANTHROPIC_API_KEY")
+			os.Exit(1)
+		}
+		mlClient = anthropicClient.NewClient(anthropicClient.Options{
+			APIKey:           c.AnthropicAPIKey,
+			BaseURL:          c.AnthropicBaseURL,
+			DispatchModel:    c.AnthropicDispatchModel,
+			SummaryModel:     c.AnthropicSummaryModel,
+			CleanupModel:     c.AnthropicCleanupModel,
+			AllowedCallTypes: allowedCallTypes,
+			Timeout:          c.AnthropicTimeout,
+			MaxTokens:        c.AnthropicMaxTokens,
+		})
+	case "openai":
+		slog.Info("initializing OpenAI ML backend", slog.String("model", c.OpenAIModel), slog.String("base_url", c.OpenAIBaseURL))
+		if c.OpenAIAPIKey == "" {
+			slog.Warn("OpenAI API key not provided - this may be required depending on your endpoint configuration")
+		}
+		openaiConfig := openai.DefaultConfig(c.OpenAIAPIKey)
+		if c.OpenAIBaseURL != "https://api.openai.com/v1" {
+			openaiConfig.BaseURL = c.OpenAIBaseURL
+		}
+		openaiConfig.HTTPClient = &http.Client{Timeout: c.OpenAITimeout}
+		mlClient = openaiClient.NewOpenAIClient(
+			openai.NewClientWithConfig(openaiConfig),
+			c.OpenAIModel,
+			allowedCallTypes,
+			c.OpenAIEnableThinking,
+		)
+	default:
+		slog.Error("unknown ML_BACKEND; expected \"openai\" or \"anthropic\"", slog.String("value", c.MLBackend))
+		os.Exit(1)
 	}
-	openaiConfig := openai.DefaultConfig(c.OpenAIAPIKey)
-	if c.OpenAIBaseURL != "https://api.openai.com/v1" {
-		openaiConfig.BaseURL = c.OpenAIBaseURL
+
+	// Optional dataset capture: records raw transcriptions + LLM interactions to Postgres for
+	// offline prompt refinement. Best-effort (drops rather than blocks) and fully disabled
+	// unless DATASET_ENABLED=true. When enabled, the MLClient is wrapped in a recording
+	// decorator so every dispatch-parse / rescue-summary call is logged with its I/O.
+	var recorder dataset.Recorder
+	if c.DatasetEnabled {
+		if c.DatasetPostgresURL == "" {
+			slog.Error("DATASET_ENABLED=true requires DATASET_POSTGRES_URL")
+			os.Exit(1)
+		}
+		store, err := dataset.NewStore(ctx, c.DatasetPostgresURL, c.DatasetBufferSize)
+		if err != nil {
+			slog.Error("could not initialize dataset store", slog.String("error", err.Error()))
+			os.Exit(1)
+		}
+		defer func() {
+			_ = store.Close()
+		}()
+		recorder = store
+
+		dispatchModel, summaryModel, cleanupModel := c.OpenAIModel, c.OpenAIModel, c.OpenAIModel
+		if strings.ToLower(c.MLBackend) == "anthropic" {
+			dispatchModel, summaryModel, cleanupModel = c.AnthropicDispatchModel, c.AnthropicSummaryModel, c.AnthropicCleanupModel
+		}
+		mlClient = dataset.NewRecordingMLClient(mlClient, store, dataset.DecoratorOptions{
+			Backend:          strings.ToLower(c.MLBackend),
+			DispatchModel:    dispatchModel,
+			SummaryModel:     summaryModel,
+			CleanupModel:     cleanupModel,
+			AllowedCallTypes: allowedCallTypes,
+		})
+		slog.Info("dataset capture enabled")
 	}
-	openaiConfig.HTTPClient = &http.Client{Timeout: c.OpenAITimeout}
-	// Type held as transcribe.MLClient (= DispatchMessageParser + RescueSummarizer); the
-	// concrete *OpenAIClient implements both and is the only MLClient we wire in prod.
-	var mlClient transcribe.MLClient = openaiClient.NewOpenAIClient(
-		openai.NewClientWithConfig(openaiConfig),
-		c.OpenAIModel,
-		allowedCallTypes,
-		c.OpenAIEnableThinking,
-	)
 
 	dragonflyClient, err := dragonfly.NewClient(ctx, c.DragonflyRequestTimeout, &redis.Options{
 		Addr:     c.DragonflyAddress,
@@ -185,7 +248,25 @@ func main() {
 		_ = dragonflyClient.Close()
 	}()
 
-	transcribeClient := transcribe.NewTranscribeClient(c, pulsarClient, s3Client, asrClient, mlClient, dragonflyClient)
+	// Optional CAD (PulsePoint) unit enrichment: resolves the units assigned to the active
+	// rescue so garbled unit callsigns can be canonicalized in cleanup + summaries. Best-effort
+	// and fully disabled unless PULPO_ENABLED=true. A nil resolver means "no enrichment".
+	var unitResolver transcribe.UnitResolver
+	if c.PulpoEnabled {
+		if c.PulpoBaseURL == "" || c.PulpoAPIKey == "" || c.PulpoAgencyID == "" {
+			slog.Error("PULPO_ENABLED=true requires PULPO_BASE_URL, PULPO_API_KEY, and PULPO_AGENCY_ID")
+			os.Exit(1)
+		}
+		unitResolver = pulsepoint.NewResolver(pulsepoint.Options{
+			BaseURL:  c.PulpoBaseURL,
+			APIKey:   c.PulpoAPIKey,
+			AgencyID: c.PulpoAgencyID,
+			Timeout:  c.PulpoTimeout,
+		})
+		slog.Info("PulsePoint unit enrichment enabled", slog.String("agency_id", c.PulpoAgencyID))
+	}
+
+	transcribeClient := transcribe.NewTranscribeClient(c, pulsarClient, s3Client, asrClient, mlClient, dragonflyClient, recorder, unitResolver)
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)

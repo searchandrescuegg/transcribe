@@ -68,6 +68,14 @@ func (m *mockMLClient) SummarizeRescue(ctx context.Context, input ml.RescueSumma
 	return args.Get(0).(*ml.RescueSummary), args.Error(1)
 }
 
+func (m *mockMLClient) CleanTACTranscript(ctx context.Context, in ml.TACCleanupInput) (*ml.TACCleanupResult, error) {
+	args := m.Called(ctx, in)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*ml.TACCleanupResult), args.Error(1)
+}
+
 // ============================================================================
 // Suite
 // ============================================================================
@@ -461,10 +469,10 @@ func (s *DispatchSuite) TestSweep_SummaryDataAliveDuringChatUpdate() {
 	// invariant the regression busted (cleanup was running BEFORE the feedback URL was built).
 	slackMock.On("UpdateMessageContext", mock.Anything, "C-TEST", "ts-1", mock.Anything).
 		Return("C-TEST", "ts-1", "", nil).Run(func(args mock.Arguments) {
-			exists, err := s.rdb.Exists(s.ctx, fmt.Sprintf(summaryDataKeyFmt, tgid)).Result()
-			s.Require().NoError(err)
-			s.EqualValues(1, exists, "summary_data must still exist when chat.update fires; otherwise the feedback URL builder couldn't have used the headline/situation summary")
-		}).Once()
+		exists, err := s.rdb.Exists(s.ctx, fmt.Sprintf(summaryDataKeyFmt, tgid)).Result()
+		s.Require().NoError(err)
+		s.EqualValues(1, exists, "summary_data must still exist when chat.update fires; otherwise the feedback URL builder couldn't have used the headline/situation summary")
+	}).Once()
 	slackMock.On("SendMessageContext", mock.Anything, "C-TEST", mock.Anything).
 		Return("C-TEST", "ts-closed", "", nil).Once()
 
@@ -706,6 +714,96 @@ func (s *DispatchSuite) TestLiveInterpretation_ConcurrentBurst_BoundedToTwoLLMCa
 	s.Empty(lockAfter, "summary lock must be released after the catch-up pass")
 }
 
+// Additive summary: the second pass must receive the first pass's summary as PreviousSummary so
+// the model extends rather than rewrites. publishLiveInterpretation caches summary_data after
+// each pass; the next pass reads it back.
+func (s *DispatchSuite) TestLiveInterpretation_Additive_PassesPreviousSummary() {
+	slackMock := new(mockSlackPoster)
+	mlMock := new(mockMLClient)
+	tc := s.newClientUnderTest(slackMock, mlMock)
+
+	tgid := talkgroupFromRadioShortCode["TAC10"].TGID
+	meta := ClosureMeta{
+		TGID: tgid, TACChannel: "TAC10", ThreadTS: "ts-rescue", SourceTalkgroup: FireDispatch1TGID,
+		MessageTS: "ts-rescue", Transcription: "Rescue Trail TAC 10 ...",
+	}
+	payload, _ := json.Marshal(meta)
+	s.Require().NoError(tc.dragonflyClient.Set(s.ctx, fmt.Sprintf(tacMetaKeyFmt, tgid), 1*time.Hour, string(payload)))
+
+	// First pass: no prior summary. Returns a summary carrying one key event.
+	mlMock.On("SummarizeRescue", mock.Anything, mock.MatchedBy(func(in ml.RescueSummaryInput) bool {
+		return in.PreviousSummary == nil && len(in.TACTranscripts) == 1
+	})).Return(&ml.RescueSummary{
+		Headline:  "Hiker with leg injury on Mount Si",
+		KeyEvents: []ml.RescueSummaryEvent{{CapturedAt: "14:02", Description: "Battalion 171 on scene"}},
+	}, nil).Once()
+
+	// Second pass: must see the first summary as PreviousSummary, with its key event intact.
+	mlMock.On("SummarizeRescue", mock.Anything, mock.MatchedBy(func(in ml.RescueSummaryInput) bool {
+		return in.PreviousSummary != nil &&
+			in.PreviousSummary.Headline == "Hiker with leg injury on Mount Si" &&
+			len(in.PreviousSummary.KeyEvents) == 1 &&
+			in.PreviousSummary.KeyEvents[0].Description == "Battalion 171 on scene"
+	})).Return(&ml.RescueSummary{Headline: "updated"}, nil).Once()
+
+	slackMock.On("SendMessageContext", mock.Anything, "C-TEST", mock.Anything).
+		Return("C-TEST", "ts-summary-1", "", nil).Once()
+	slackMock.On("UpdateMessageContext", mock.Anything, "C-TEST", "ts-summary-1", mock.Anything).
+		Return("C-TEST", "ts-summary-1", "", nil).Once()
+
+	tc.updateLiveInterpretation(s.ctx, tgid, time.Now(), "on scene")
+	tc.updateLiveInterpretation(s.ctx, tgid, time.Now(), "requesting SAR")
+
+	mlMock.AssertExpectations(s.T())
+	slackMock.AssertExpectations(s.T())
+}
+
+// processNonDispatchCall must clean the raw ASR transcription (when TAC_CLEANUP_ENABLED) before
+// posting it to the thread and before it enters the cumulative summary.
+func (s *DispatchSuite) TestProcessNonDispatchCall_CleansBeforePostingAndStoring() {
+	slackMock := new(mockSlackPoster)
+	mlMock := new(mockMLClient)
+	tc := s.newClientUnderTest(slackMock, mlMock)
+	tc.config.TACCleanupEnabled = true // default test config leaves it off
+
+	tgid := talkgroupFromRadioShortCode["TAC10"].TGID
+	// Route the TAC talkgroup to a rescue thread + provide dispatch context for cleanup.
+	s.Require().NoError(tc.dragonflyClient.Set(s.ctx, fmt.Sprintf(talkgroupKeyPrefix, tgid), 1*time.Hour, "ts-rescue"))
+	meta := ClosureMeta{TGID: tgid, TACChannel: "TAC10", ThreadTS: "ts-rescue", SourceTalkgroup: FireDispatch1TGID, MessageTS: "ts-rescue", Transcription: "Rescue Trail TAC 10 Mount Si"}
+	payload, _ := json.Marshal(meta)
+	s.Require().NoError(tc.dragonflyClient.Set(s.ctx, fmt.Sprintf(tacMetaKeyFmt, tgid), 1*time.Hour, string(payload)))
+
+	const raw = "units on tack 2 norwell hill trail"
+	const cleaned = "Units on TAC2, Norway Hill Trail"
+
+	mlMock.On("CleanTACTranscript", mock.Anything, mock.MatchedBy(func(in ml.TACCleanupInput) bool {
+		return in.Text == raw && in.DispatchContext == meta.Transcription
+	})).Return(&ml.TACCleanupResult{CleanedText: cleaned}, nil).Once()
+
+	// The cumulative summary must receive the CLEANED text, not the raw ASR.
+	mlMock.On("SummarizeRescue", mock.Anything, mock.MatchedBy(func(in ml.RescueSummaryInput) bool {
+		return len(in.TACTranscripts) == 1 && in.TACTranscripts[0].Text == cleaned
+	})).Return(&ml.RescueSummary{Headline: "h"}, nil).Once()
+
+	// Two SendMessageContext calls: the per-transmission thread reply + the first live-interp post.
+	slackMock.On("SendMessageContext", mock.Anything, "C-TEST", mock.Anything).
+		Return("C-TEST", "ts-x", "", nil).Twice()
+
+	parsed := &AdornedDeconstructedKey{dk: &DeconstructedKey{Talkgroup: tgid, Time: time.Now()}}
+	err := tc.processNonDispatchCall(s.ctx, parsed, stubASRResponse(raw))
+	s.Require().NoError(err)
+
+	mlMock.AssertExpectations(s.T())
+	slackMock.AssertExpectations(s.T())
+
+	// The stored transcript (fed to future summaries) must be the cleaned text.
+	entries, err := s.rdb.LRange(s.ctx, fmt.Sprintf(tacTranscriptsKeyFmt, tgid), 0, -1).Result()
+	s.Require().NoError(err)
+	s.Require().Len(entries, 1)
+	s.Contains(entries[0], "Norway Hill Trail", "cumulative transcript stores the cleaned text")
+	s.NotContains(entries[0], "norwell", "raw ASR must not be stored")
+}
+
 func (s *DispatchSuite) TestLiveInterpretation_NoMeta_IsNoOp() {
 	slackMock := new(mockSlackPoster)
 	mlMock := new(mockMLClient)
@@ -848,7 +946,6 @@ func (s *DispatchSuite) TestProcessRecord_DispatchPath_ClearsInFlightOnExit() {
 	s.Require().NoError(err)
 	s.EqualValues(0, exists, "dispatch_in_flight must be cleared by processRecord's defer, even on panic-unwind")
 }
-
 
 // ============================================================================
 // handleMessage: 3 cases (uses the Pulsar container for real ack/nack lifecycle)

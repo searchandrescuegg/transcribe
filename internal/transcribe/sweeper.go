@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/searchandrescuegg/transcribe/internal/ml"
 	"github.com/slack-go/slack"
 )
 
@@ -123,6 +124,7 @@ func (tc *TranscribeClient) sweepOnce(ctx context.Context) {
 				fmt.Sprintf(summaryLockKeyFmt, tgid),
 				fmt.Sprintf(summaryStaleKeyFmt, tgid),
 				fmt.Sprintf(summaryDataKeyFmt, tgid),
+				fmt.Sprintf(pulpoUnitsKeyFmt, tgid),
 			)
 		}
 
@@ -202,6 +204,8 @@ func (tc *TranscribeClient) updateAlertForClosure(ctx context.Context, m *Closur
 		TACTalkgroupTGID: m.TGID,
 		ClosedAt:         &closedAt,
 		FeedbackURL:      feedbackURL,
+		// Preserve the SAR-notified badge on the closed alert if it was set during the rescue.
+		SARNotified: tc.summarySARNotified(ctx, m.TGID),
 	})
 
 	updateCtx, cancel := context.WithTimeout(ctx, tc.config.SlackTimeout)
@@ -219,4 +223,27 @@ func (tc *TranscribeClient) updateAlertForClosure(ctx context.Context, m *Closur
 			slog.String("tac", m.TACChannel),
 			slog.String("message_ts", m.MessageTS))
 	}
+}
+
+// readSummaryData reads and decodes the latest cached RescueSummary for a rescue. Returns
+// (nil, false) when the key is missing or unparseable. Best-effort: callers treat a false ok as
+// "no prior summary" and proceed.
+func (tc *TranscribeClient) readSummaryData(ctx context.Context, tgid string) (*ml.RescueSummary, bool) {
+	raw, err := tc.dragonflyClient.Get(ctx, fmt.Sprintf(summaryDataKeyFmt, tgid))
+	if err != nil || raw == "" {
+		return nil, false
+	}
+	var s ml.RescueSummary
+	if err := json.Unmarshal([]byte(raw), &s); err != nil {
+		return nil, false
+	}
+	return &s, true
+}
+
+// summarySARNotified reads the latest cached RescueSummary and reports whether SAR was
+// notified, so the green-check badge survives onto the closed alert. Best-effort — any read
+// or decode failure defaults to false (no badge).
+func (tc *TranscribeClient) summarySARNotified(ctx context.Context, tgid string) bool {
+	s, ok := tc.readSummaryData(ctx, tgid)
+	return ok && s.SARNotified
 }

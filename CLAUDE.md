@@ -40,9 +40,16 @@ button opens a Google Form prefilled with incident context.
 | Confidential call types: AES-256-GCM, env-supplied key | Encrypted file in repo, key in secret manager | `internal/calltypes/calltypes.go` |
 | Process-global `time.Local` override at startup | Single point of truth for display TZ; all `.Local()` calls inherit | `cmd/transcribe/main.go` |
 | `chat_template_kwargs.enable_thinking=false` per-request + `<think>` stripper | First-party server-side switch for Qwen3-family + defense-in-depth post-hoc strip | `internal/openai/openai.go` |
-| OpenAI client implements both `DispatchMessageParser` AND `RescueSummarizer` | One concrete client, two interfaces; `transcribe.MLClient` combines them | `internal/transcribe/transcribe.go` (interface), `internal/openai/openai.go` (impl) |
+| Each ML backend implements `DispatchMessageParser`, `RescueSummarizer`, AND `TranscriptCleaner` | One concrete client per backend, three interfaces; `transcribe.MLClient` combines them | `internal/transcribe/transcribe.go` (interface), `internal/openai/openai.go` + `internal/anthropic/anthropic.go` (impls) |
 | `SlackPoster` interface with `SendMessageContext` + `UpdateMessageContext` | `*slack.Client` satisfies structurally; tests inject testify mock | `internal/transcribe/transcribe.go` |
-| Removed Ollama-specific client; OpenAI-compatible is the only ML path | Ollama still works — operators set `OPENAI_BASE_URL=http://ollama:11434/v1` | n/a (deletion) |
+| Two selectable ML backends behind one interface: OpenAI-compatible and first-party Anthropic | `ML_BACKEND` chooses at startup; both implement `transcribe.MLClient`. Ollama/vLLM/LiteLLM still work via `OPENAI_BASE_URL` | `cmd/transcribe/main.go`, `internal/openai/`, `internal/anthropic/` |
+| Shared prompt + schema contract in `internal/prompts` | Single source of truth so the two backends can't drift on wording or output shape | `internal/prompts/prompts.go`, `internal/prompts/schema.go` |
+| Anthropic backend uses native structured outputs (`output_config.format`) with thinking disabled | GA structured-output path; thinking off keeps short extraction/classification calls fast and bounded to `WorkerTimeout` | `internal/anthropic/anthropic.go` |
+| Optional Postgres dataset capture: async best-effort decorator + direct writes | Compile a transcription + LLM-I/O corpus for prompt refinement without ever blocking the pipeline (drops on full buffer, never errors upward) | `internal/dataset/`, `internal/transcribe/transcribe.go` (processRecord), `cmd/transcribe/main.go` |
+| SAR-notified green-check badge, latched via the `summary_data` false→true transition | Surfaces "Search & Rescue notified" on the parent alert + live interpretation; fires exactly one extra `chat.update` per rescue and adds **no** new sidecar key (transition detected by reading `summary_data` before overwrite; expiry for the mid-rescue re-render read from `active_tacs` via `ZScore`) | `internal/prompts` (rule #10), `live_interpretation.go` (`badgeParentAlertSAR`), `slack.go` (`buildSARNotifiedBlock`), `sweeper.go` (`summarySARNotified`, closed-alert badge) |
+| Additive live-interpretation summary: prev summary fed back as input | Stops key-event churn — the model EXTENDS its prior summary (preserve established KeyEvents, append new) instead of re-deriving from scratch each transmission. Prev summary read from the existing `summary_data` (no new key); missing/garbled prior degrades to the old full-rewrite behavior | `internal/prompts` (summary rule #12 + `renderPreviousSummary`), `ml.RescueSummaryInput.PreviousSummary`, `live_interpretation.go` (`runOneSummaryPass` reads `readSummaryData`) |
+| Per-transmission LLM cleanup of TAC traffic | Raw ASR TAC transmissions were posted verbatim; a dedicated (cheap-model) cleanup call fixes ASR errors, place names (gazetteer), and unit callsigns before the thread reply AND the summary. Best-effort with raw fallback; kill-switch `TAC_CLEANUP_ENABLED` | `internal/ml` (`TranscriptCleaner`), `internal/prompts` (`TACCleanupSystemPrompt`), both backends' `CleanTACTranscript`, `process.go` (`maybeCleanTranscript`) |
+| CAD (PulsePoint) unit enrichment behind an optional resolver | Feeds the units actually assigned to the call into cleanup + summary so garbled callsigns snap to real units. Fuzzy correlation (location + call-type + recency) with agency-roster fallback; entirely best-effort and flag-gated (`PULPO_ENABLED`). Cached per-rescue in `pulpo_units:<TGID>` | `internal/pulsepoint/` (Resolver, `selectUnitContext`, `UnitContext.PromptBlock`), `transcribe.UnitResolver`, `unit_context.go` (`unitContextFor`) |
 
 ---
 
@@ -81,14 +88,18 @@ Each was discovered (and fixed) during development; comments in code reference t
 
 6. **Cancel / Switch / sweeper close MUST clean up ALL sidecars**: `tac_meta:<TGID>`,
    `tac_transcripts:<TGID>`, `summary_ts:<TGID>`, `summary_lock:<TGID>`,
-   `summary_stale:<TGID>`, `summary_data:<TGID>`, `tg:<TGID>`, plus SREM from
-   `allowed_talkgroups` and ZREM from `active_tacs`. Missing one = a closed-then-reopened
-   rescue inherits stale state from the prior incident. (`sweeper.go`, `slackctl/cancel.go`,
-   `slackctl/switch_tac.go`)
+   `summary_stale:<TGID>`, `summary_data:<TGID>`, `pulpo_units:<TGID>`, `tg:<TGID>`, plus
+   SREM from `allowed_talkgroups` and ZREM from `active_tacs`. Missing one = a
+   closed-then-reopened rescue inherits stale state from the prior incident. (`sweeper.go`,
+   `slackctl/cancel.go`, `slackctl/switch_tac.go`)
 
-7. **`WorkerTimeout >= OpenAITimeout`** — the worker context wraps the LLM round-trip;
-   if it cancels first, the LLM call gets canceled before it can answer. Currently 180s vs
-   120s in `.env`. (`internal/config/config.go`)
+7. **`WorkerTimeout` must cover EVERY serial LLM call in a worker, not just one** — the worker
+   context wraps the whole record. A TAC transmission now runs the cleanup call THEN the summary
+   call sequentially, so the budget must exceed `TACCleanupTimeout + summary round-trip` (plus S3
+   + ASR), not merely one LLM timeout. `TACCleanupTimeout` (default 20s) sub-bounds the cleanup so
+   it can't starve the thread reply + summary; keep `WorkerTimeout` comfortably above the sum.
+   Currently 180s worker vs 120s OpenAI (or 30s Anthropic) per call. (`internal/config/config.go`,
+   `process.go` `maybeCleanTranscript`)
 
 8. **`time.Local` override happens BEFORE any time-formatting code runs** — set in
    `main.go` immediately after config + slog are wired. Tests that depend on display
@@ -130,6 +141,7 @@ visible at both layers).
 | `summary_data:<TGID>` | STRING (JSON `RescueSummary`) | `publishLiveInterpretation` writes after every summarize | 2 × `TacticalChannelActivationDuration` | Latest structured summary; read by sweeper for feedback URL prefill |
 | `summary_lock:<TGID>` | STRING (`"1"`) | `updateLiveInterpretation` SETNX before LLM call | 150s | Per-TGID exclusion: bounds concurrent LLM calls to ~2 per burst |
 | `summary_stale:<TGID>` | STRING (`"1"`) | Set by lock losers; cleared by lock holder | 60s | "New transmission arrived during your work — rerun summary" |
+| `pulpo_units:<TGID>` | STRING (rendered unit block, or `\x00none` sentinel) | `unitContextFor` / `resolveAndCacheUnitContext` write; cleanup DELs | `PulpoRefreshInterval` (default 45s) | Cached CAD unit-context block for cleanup + summary; short TTL so the roster self-refreshes as units are added |
 
 ---
 
@@ -167,12 +179,16 @@ read TGID from the button's `value` field instead.
 | Mockserver (local) / cluster Whisper/Parakeet (prod) | ASR | Real returns `{"text": ..., "no_speech_detected": ...}` |
 | OpenAI-compatible chat completions | Dispatch parsing + rescue summarization | llama.cpp, Ollama, vLLM, OpenAI all work via `OPENAI_BASE_URL` |
 | `slack-go/slack` (+ `socketmode` submodule) | Slack client | Uses `chat_template_kwargs` field |
-| `sashabaranov/go-openai` | OpenAI client | Has `ChatTemplateKwargs` field for vLLM/llama.cpp passthrough |
+| `sashabaranov/go-openai` | OpenAI client | Has `ChatTemplateKwargs` field for vLLM/llama.cpp passthrough; also provides the shared `jsonschema` generator |
+| `anthropics/anthropic-sdk-go` | Anthropic client | Used when `ML_BACKEND=anthropic`; native structured outputs via `output_config.format` |
 | `caarlos0/env/v11` | Config from env | All config in `internal/config/config.go` |
 | `testify` (suite, mock, assert, require) | Testing | |
 | `testcontainers-go` | Integration tests | Spins up Dragonfly + Pulsar containers |
 | `apache/pulsar-client-go` | Pulsar client | |
 | `redis/go-redis/v9` | Redis client (for Dragonfly) | |
+| Postgres 17 | Dataset store (optional) | Enabled via `DATASET_ENABLED`; local via docker-compose, self-hosted in prod |
+| `jackc/pgx/v5` | Postgres driver | Used through `database/sql` (`stdlib`) for dataset writes |
+| `pressly/goose/v3` | DB migrations | Embedded SQL migrations applied at startup |
 
 ---
 
@@ -237,7 +253,8 @@ read TGID from the button's `value` field instead.
 | `internal/transcribe/transcribe.go` | `Work`, `handleMessage`, `processRecord` — top-level message lifecycle |
 | `internal/transcribe/process.go` | `processDispatchCall`, `processNonDispatchCall` |
 | `internal/transcribe/sweeper.go` | `Sweep`, `sweepOnce`, `postChannelClosed`, `updateAlertForClosure` — durable closure scheduling |
-| `internal/transcribe/live_interpretation.go` | `updateLiveInterpretation` + per-TGID lock pattern |
+| `internal/transcribe/live_interpretation.go` | `updateLiveInterpretation` + per-TGID lock pattern; additive summary (prev summary fed back) |
+| `internal/transcribe/unit_context.go` | `unitContextFor` / `resolveAndCacheUnitContext` — per-rescue CAD unit-context cache (best-effort, nil-resolver safe) |
 | `internal/transcribe/feedback.go` | `buildFeedbackURL` — Google Form URL with prefill |
 | `internal/transcribe/slack.go` | All Slack block builders (alert, live interpretation, channel closed, thread comm, action block, feedback button) |
 | `internal/transcribe/slack_send.go` | `sendSlackWithRetry` (rate-limit-aware single retry) |
@@ -248,12 +265,19 @@ read TGID from the button's `value` field instead.
 | `internal/slackctl/cancel.go` | `CancelTAC` state mutations + `handleCancel` Slack-side wiring |
 | `internal/slackctl/extend.go` | `ExtendTAC` + `handleExtend` |
 | `internal/slackctl/switch_tac.go` | `SwitchTAC` + `handleSwitchTAC`; `parseOldTGIDFromBlockID` |
-| `internal/openai/openai.go` | `OpenAIClient` implementing both `DispatchMessageParser` and `RescueSummarizer`; system prompts as constants |
+| `internal/prompts/prompts.go` | Shared prompt text + system/user prompt builders for both ML backends |
+| `internal/prompts/schema.go` | Shared response-schema builders (`DispatchSchema` with enum injection, `RescueSummarySchema`) |
+| `internal/openai/openai.go` | `OpenAIClient` (OpenAI-compatible) implementing both `DispatchMessageParser` and `RescueSummarizer`; delegates prompts/schema to `internal/prompts` |
+| `internal/anthropic/anthropic.go` | `Client` (first-party Anthropic) implementing all three ML interfaces via native structured outputs; per-task models (dispatch / summary / cleanup, each independently configurable) |
+| `internal/pulsepoint/` | Optional CAD (PulsePoint) unit enrichment: `Resolver` over the `pulpo` client, fuzzy incident match (`selectUnitContext`) with agency-roster fallback, `UnitContext.PromptBlock` |
+| `internal/dataset/dataset.go` | Dataset records, `Recorder` interface, `RecordingMLClient` decorator, request-context source correlation |
+| `internal/dataset/store.go` | Postgres-backed `Recorder`: embedded goose migrations + async best-effort writer |
+| `internal/dataset/migrations/*.sql` | goose migrations for the `transcriptions` + `llm_interactions` tables |
 | `internal/calltypes/calltypes.go` | AES-256-GCM encrypt/decrypt + parser for the call-types file |
 | `internal/dragonfly/dragonfly.go` | Dragonfly client wrapper (per-method timeouts) |
 | `internal/pulsar/client.go` | Pulsar consumer wrapper with DLQ policy |
 | `internal/asr/client.go` | ASR HTTP client (multipart upload) |
-| `internal/ml/interfaces.go` | All ML data types: `DispatchMessages`, `RescueSummary`, `RescueSummaryInput`, etc. |
+| `internal/ml/interfaces.go` | All ML data types + interfaces: `DispatchMessageParser`, `RescueSummarizer`, `TranscriptCleaner`; `DispatchMessages`, `RescueSummary`, `RescueSummaryInput` (with `PreviousSummary`/`UnitContext`), `TACCleanupInput`/`TACCleanupResult`, etc. |
 | `internal/config/config.go` | Single source of truth for env-var config |
 | `slack/manifest.yaml` | Slack app manifest — paste at api.slack.com/apps |
 | `config/call_types.example.txt` | Sample plaintext for the encrypted call-types file |
@@ -321,12 +345,12 @@ TRANSCRIPTION_FILE=data/transcription.txt \
 ## Prompt iteration
 
 The two LLM-driven features have their prompts as constants in
-`internal/openai/openai.go`:
+`internal/prompts/prompts.go` (shared by both the OpenAI and Anthropic backends):
 
-- **Dispatch parsing**: `defaultSystemPrompt` (when `allowedCallTypes` is empty) or
-  `constrainedSystemPromptHead` + per-call enum + `constrainedSystemPromptTail` (when
-  configured). Edits affect every dispatch event.
-- **Rescue summarization**: `rescueSummarySystemPrompt`. Edits affect every TAC
+- **Dispatch parsing**: `DispatchSystemPrompt(allowedCallTypes)` returns `defaultSystemPrompt`
+  (when `allowedCallTypes` is empty) or `constrainedSystemPromptHead` + per-call enum +
+  `constrainedSystemPromptTail` (when configured). Edits affect every dispatch event.
+- **Rescue summarization**: `RescueSummarySystemPrompt`. Edits affect every TAC
   transmission.
 
 After editing, iterate via `cmd/test-transcription` or `cmd/test-summary` against fixture

@@ -180,11 +180,21 @@ func (tc *TranscribeClient) runOneSummaryPass(ctx context.Context, tacTGID, list
 		return false
 	}
 
+	// Additive context: feed the model its own PREVIOUS summary (if any) so it extends the
+	// established record rather than re-deriving it — this is what stops key events from churning
+	// between transmissions. A missing/unparseable prior summary simply degrades to a fresh
+	// (full-rewrite) pass. Also feed the CAD unit roster (empty when enrichment is off) so garbled
+	// callsigns can be canonicalized.
+	previousSummary, _ := tc.readSummaryData(ctx, tacTGID)
+	unitContext := tc.unitContextFor(ctx, tacTGID, meta.Transcription, time.Now())
+
 	summary, err := tc.mlClient.SummarizeRescue(ctx, ml.RescueSummaryInput{
 		DispatchTranscription: meta.Transcription,
 		DispatchCallType:      "Rescue - Trail",
 		TACChannel:            meta.TACChannel,
 		TACTranscripts:        transcripts,
+		PreviousSummary:       previousSummary,
+		UnitContext:           unitContext,
 	})
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -207,6 +217,10 @@ func (tc *TranscribeClient) runOneSummaryPass(ctx context.Context, tacTGID, list
 // rescue thread. The message_ts is cached in summary_ts:<TGID> with the same TTL as the
 // transcripts list so an active rescue keeps a stable summary anchor.
 func (tc *TranscribeClient) publishLiveInterpretation(ctx context.Context, tacTGID string, meta ClosureMeta, summary *ml.RescueSummary, ttl time.Duration) {
+	// Read the previous SAR-notified state BEFORE overwriting summary_data, so we can detect
+	// the false→true transition and badge the parent alert exactly once (see below).
+	wasNotified := tc.summarySARNotified(ctx, tacTGID)
+
 	// Cache the latest structured summary so the close path can prefill the feedback form
 	// without needing to re-run the LLM. Best-effort — if this write fails the live message
 	// still posts; the feedback button will just open with fewer prefilled fields.
@@ -216,6 +230,15 @@ func (tc *TranscribeClient) publishLiveInterpretation(ctx context.Context, tacTG
 				slog.String("error", err.Error()),
 				slog.String("tgid", tacTGID))
 		}
+	}
+
+	// On the first transmission that reports SAR notification, badge the parent alert with the
+	// green check. Gated on the false→true transition (via the pre-write read above) so we do
+	// exactly one extra chat.update per rescue, not one per subsequent transmission. SAR
+	// notification is monotonic — the mention stays in the cumulative transcript history — so
+	// once badged it stays badged.
+	if summary.SARNotified && !wasNotified {
+		tc.badgeParentAlertSAR(ctx, tacTGID, meta)
 	}
 
 	blocks := BuildLiveInterpretationBlocks(summary, time.Now().Local())
@@ -262,6 +285,53 @@ func (tc *TranscribeClient) publishLiveInterpretation(ctx context.Context, tacTG
 			slog.String("error", err.Error()),
 			slog.String("tgid", tacTGID))
 	}
+}
+
+// badgeParentAlertSAR re-renders the parent rescue alert with the green-check "Search &
+// Rescue notified" badge and chat.update's it in place. Called once per rescue on the
+// SAR-notified transition. Best-effort: any failure logs and returns — the live
+// interpretation message still carries the SAR badge regardless.
+//
+// The current expiry is read from the active_tacs ZSET (score = unix expiry) so the live
+// "Expires …" line stays accurate — including after an Extend — without threading the expiry
+// through ClosureMeta. If the expiry can't be read (rescue already closing/closed), skip
+// rather than render a bogus timestamp.
+func (tc *TranscribeClient) badgeParentAlertSAR(ctx context.Context, tgid string, meta ClosureMeta) {
+	if meta.MessageTS == "" || meta.Transcription == "" {
+		return // no message to update, or can't rebuild the alert faithfully
+	}
+
+	score, err := tc.dragonflyClient.ZScore(ctx, activeTACsKey, tgid)
+	if err != nil {
+		slog.Warn("live interpretation: SAR badge skipped; could not read expiry from active_tacs",
+			slog.String("error", err.Error()), slog.String("tgid", tgid))
+		return
+	}
+	expiresAt := time.Unix(int64(score), 0).Local()
+
+	blocks := BuildRescueTrailBlocks(&RescueTrailBlocksInput{
+		TACChannel:        meta.TACChannel,
+		TranscriptionText: meta.Transcription,
+		ExpiresAt:         expiresAt,
+		DispatchTGID:      FireDispatch1TGID,
+		TACTalkgroupTGID:  meta.TGID, // keeps the Cancel/Close/Extend/Switch actions on the live alert
+		SARNotified:       true,
+	})
+
+	updateCtx, cancel := context.WithTimeout(ctx, tc.config.SlackTimeout)
+	defer cancel()
+	if _, _, _, err := tc.slackClient.UpdateMessageContext(updateCtx,
+		tc.config.SlackChannelID,
+		meta.MessageTS,
+		slack.MsgOptionBlocks(blocks...),
+		slack.MsgOptionText(fmt.Sprintf("%s — Search & Rescue notified", meta.TACChannel), false),
+	); err != nil {
+		slog.Warn("live interpretation: failed to badge parent alert with SAR-notified",
+			slog.String("error", err.Error()), slog.String("tgid", tgid), slog.String("message_ts", meta.MessageTS))
+		return
+	}
+	slog.Info("live interpretation: badged parent alert — SAR notified",
+		slog.String("tgid", tgid), slog.String("tac", meta.TACChannel))
 }
 
 // sendSlackInThread is a convenience wrapper that goes through sendSlackWithRetry and also
