@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	pulsarapi "github.com/apache/pulsar-client-go/pulsar"
 	"github.com/searchandrescuegg/transcribe/internal/asr"
 	"github.com/searchandrescuegg/transcribe/internal/config"
+	"github.com/searchandrescuegg/transcribe/internal/dataset"
 	"github.com/searchandrescuegg/transcribe/internal/dragonfly"
 	"github.com/searchandrescuegg/transcribe/internal/ml"
 	"github.com/searchandrescuegg/transcribe/internal/pulsar"
@@ -47,13 +49,23 @@ type SlackPoster interface {
 	UpdateMessageContext(ctx context.Context, channelID, timestamp string, options ...slack.MsgOption) (string, string, string, error)
 }
 
-// MLClient bundles the two ML capabilities the worker uses: the dispatch-parser for
-// turning a raw transcription into structured trail-rescue info, and the summarizer that
-// turns dispatch + ordered TAC transmissions into a structured situational summary.
-// *openai.OpenAIClient implements both, so production wiring stays a single dependency.
+// MLClient bundles the ML capabilities the worker uses: the dispatch-parser for turning a raw
+// transcription into structured trail-rescue info, the per-transmission TAC cleaner, and the
+// summarizer that turns dispatch + ordered TAC transmissions into a structured situational
+// summary. Both the OpenAI-compatible and Anthropic backends implement all three, so production
+// wiring stays a single dependency.
 type MLClient interface {
 	ml.DispatchMessageParser
 	ml.RescueSummarizer
+	ml.TranscriptCleaner
+}
+
+// UnitResolver produces a rendered "units currently assigned to the call" prompt block from the
+// CAD (PulsePoint) feed, used to canonicalize garbled unit callsigns in cleanup and summaries.
+// Optional — nil when PULPO_ENABLED is false, in which case unit context is simply empty and the
+// LLM calls run exactly as they did before. Implemented by *pulsepoint.Resolver.
+type UnitResolver interface {
+	RescueUnitBlock(ctx context.Context, dispatchText string, referenceTime time.Time) (string, error)
 }
 
 type TranscribeClient struct {
@@ -64,10 +76,17 @@ type TranscribeClient struct {
 	slackClient     SlackPoster
 	dragonflyClient *dragonfly.DragonflyClient
 
+	// recorder is the optional dataset sink. Nil disables raw-transcription capture (the
+	// LLM-interaction side is captured by the recording MLClient decorator instead).
+	recorder dataset.Recorder
+
+	// unitResolver is the optional CAD unit-enrichment source. Nil disables enrichment.
+	unitResolver UnitResolver
+
 	config *config.Config
 }
 
-func NewTranscribeClient(config *config.Config, pulsarClient *pulsar.PulsarClient, s3Client *s3.S3Client, asrClient *asr.ASRClient, mlClient MLClient, dragonflyClient *dragonfly.DragonflyClient) *TranscribeClient {
+func NewTranscribeClient(config *config.Config, pulsarClient *pulsar.PulsarClient, s3Client *s3.S3Client, asrClient *asr.ASRClient, mlClient MLClient, dragonflyClient *dragonfly.DragonflyClient, recorder dataset.Recorder, unitResolver UnitResolver) *TranscribeClient {
 	return &TranscribeClient{
 		pulsarClient:    pulsarClient,
 		s3Client:        s3Client,
@@ -75,6 +94,8 @@ func NewTranscribeClient(config *config.Config, pulsarClient *pulsar.PulsarClien
 		mlClient:        mlClient,
 		slackClient:     slack.New(config.SlackToken),
 		dragonflyClient: dragonflyClient,
+		recorder:        recorder,
+		unitResolver:    unitResolver,
 		config:          config,
 	}
 }
@@ -265,6 +286,24 @@ func (tc *TranscribeClient) processRecord(ctx context.Context, record *s3event.E
 		return fmt.Errorf("failed to transcribe file: %w", err)
 	}
 	slog.Info("transcription completed", slog.String("key", key), slog.String("transcription", tr.Transcription), slog.Bool("no_speech", tr.NoSpeechDetected))
+
+	isDispatch := parsedKey.dk.Talkgroup == FireDispatch1TGID
+
+	// Best-effort dataset capture. Record the raw transcription (including no-speech ones,
+	// which the flag preserves) and stamp the source onto ctx so the recording MLClient
+	// decorator can correlate the downstream LLM call back to this audio object. Both are
+	// no-ops when capture is disabled (recorder == nil).
+	if tc.recorder != nil {
+		ctx = dataset.ContextWithSource(ctx, key, parsedKey.dk.Talkgroup)
+		tc.recorder.RecordTranscription(dataset.TranscriptionRecord{
+			S3Key:            key,
+			Talkgroup:        parsedKey.dk.Talkgroup,
+			CapturedAt:       parsedKey.dk.Time,
+			Transcription:    tr.Transcription,
+			NoSpeechDetected: tr.NoSpeechDetected,
+			IsDispatch:       isDispatch,
+		})
+	}
 
 	// Radio captures often include squelch clicks, brief tones, or empty cuts. The ASR
 	// flags these via NoSpeechDetected (or returns an empty body). Treat them as a clean

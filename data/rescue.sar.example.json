@@ -1,0 +1,23 @@
+{
+  "dispatch": "Rescue Trail Tac 8 Snoqualmie Battalion 171 Engine 171 8171 Mount Si trailhead Southeast Mount Si Road Rescue Trail Tac 8 Snoqualmie Battalion 171 Engine 171 8171 Mount Si trailhead 1402 Hours",
+  "dispatch_call_type": "Rescue - Trail",
+  "tac_channel": "TAC8",
+  "tac": [
+    {
+      "captured_at": "14:02:10",
+      "text": "8171 Battalion 171 on scene at the Mount Sai trailhead. We have a hiker with a lower leg injury approximately three miles up the trail, patient is unable to walk out."
+    },
+    {
+      "captured_at": "14:05:44",
+      "text": "171 to dispatch, given the location and terrain this is going to be a carry-out. We're notifying Search and Rescue. Requesting King County SAR to respond."
+    },
+    {
+      "captured_at": "14:07:20",
+      "text": "Copy 171, King County Search and Rescue has been notified and is responding to the Mount Si trailhead."
+    },
+    {
+      "captured_at": "14:12:03",
+      "text": "171, patient is stable and packaged. We will stage at the trailhead until SAR arrives to assist with the carry-out."
+    }
+  ]
+}

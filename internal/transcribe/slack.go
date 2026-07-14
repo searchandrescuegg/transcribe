@@ -41,6 +41,10 @@ type RescueTrailBlocksInput struct {
 	TACTalkgroupTGID  string
 	ClosedAt          *time.Time
 	FeedbackURL       string
+	// SARNotified renders a green-check "Search & Rescue notified" badge on the alert when
+	// the live interpretation detects SAR has been contacted. Latched by the caller, so once
+	// set it persists through the closed-mode rewrite too.
+	SARNotified bool
 }
 
 // Action IDs are the routing keys the slackctl controller dispatches on. Keep these in
@@ -143,6 +147,14 @@ func BuildRescueTrailBlocks(rtbi *RescueTrailBlocksInput) []slack.Block {
 		buildRescueStatusBlock(talkgroup.ShortName, rtbi.ExpiresAt, rtbi.ClosedAt),
 	}
 
+	// SAR-notified badge, inserted right after the header for at-a-glance visibility. Gated
+	// so the not-notified path stays byte-identical to the original alert (the block builder
+	// test asserts exact JSON). The full three-index slice expression forces append to
+	// allocate rather than alias the freshly-built literal.
+	if rtbi.SARNotified {
+		blocks = append(blocks[:1:1], append([]slack.Block{buildSARNotifiedBlock()}, blocks[1:]...)...)
+	}
+
 	// Action buttons only render while the rescue is live. Once ClosedAt is set the alert
 	// is a frozen historical record — leadership can't extend or cancel a closed rescue.
 	if rtbi.TACTalkgroupTGID != "" && rtbi.ClosedAt == nil {
@@ -157,6 +169,15 @@ func BuildRescueTrailBlocks(rtbi *RescueTrailBlocksInput) []slack.Block {
 	}
 
 	return blocks
+}
+
+// buildSARNotifiedBlock renders the green-check "Search & Rescue notified" badge shared by
+// the parent alert and the live interpretation message.
+func buildSARNotifiedBlock() slack.Block {
+	return slack.NewSectionBlock(
+		slack.NewTextBlockObject(slack.MarkdownType, ":white_check_mark: *Search & Rescue notified*", false, false),
+		nil, nil,
+	)
 }
 
 // buildFeedbackButtonBlock returns the section + button that links to the prefilled form.
@@ -343,6 +364,10 @@ func BuildLiveInterpretationBlocks(s *ml.RescueSummary, updatedAt time.Time) []s
 				nil, nil,
 			),
 		)
+	}
+
+	if s.SARNotified {
+		blocks = append(blocks, buildSARNotifiedBlock())
 	}
 
 	if s.SituationSummary != "" {

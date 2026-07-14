@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/cespare/xxhash/v2"
@@ -123,6 +124,14 @@ func (tc *TranscribeClient) processDispatchCall(ctx context.Context, parsedKey *
 		slog.Error("failed to persist TAC closure schedule", slog.String("error", err.Error()), slog.String("tac_channel", dispatchMessage.TACChannel))
 	}
 
+	// Warm the CAD unit-context cache for this rescue (best-effort, no-op when enrichment is
+	// disabled). Resolving here — right after we know the incident is a trail rescue — means the
+	// first TAC transmission already has a unit roster to canonicalize against, and the dispatch
+	// capture time anchors incident-recency scoring. Failures are swallowed inside the helper.
+	if tc.unitResolver != nil {
+		tc.resolveAndCacheUnitContext(ctx, tg.TGID, tr.Transcription, parsedKey.dk.Time)
+	}
+
 	return nil
 }
 
@@ -148,12 +157,17 @@ func (tc *TranscribeClient) processNonDispatchCall(ctx context.Context, parsedKe
 
 	slog.Debug("found talkgroup information", slog.String("talkgroup", parsedKey.dk.Talkgroup), slog.Any("talkgroup_info", tgInfo))
 
+	// Clean the raw ASR transmission before it goes anywhere. The cleaned text is what we post
+	// in the thread AND what feeds the cumulative summary. Best-effort: on any failure we fall
+	// back to the raw transcription so the transmission is never dropped.
+	cleaned := tc.maybeCleanTranscript(ctx, parsedKey.dk.Talkgroup, tr.Transcription)
+
 	// FIX (review item #1): sendSlackWithRetry actually retries on rate limit; the prior path
 	// waited and discarded the message. Errors now propagate so Work() can Nack for redelivery.
 	if _, err := tc.sendSlackWithRetry(ctx, parsedKey.dk.Talkgroup,
 		slack.MsgOptionBlocks(BuildThreadCommunicationBlocks(&ThreadCommunicationBlocksInput{
 			Channel: tgInfo.FullName,
-			Message: tr.Transcription,
+			Message: cleaned,
 			TS:      time.Now().Local(),
 		})...),
 		slack.MsgOptionAsUser(true),
@@ -164,11 +178,51 @@ func (tc *TranscribeClient) processNonDispatchCall(ctx context.Context, parsedKe
 
 	slog.Debug("posted transcription message to Slack", slog.String("talkgroup", parsedKey.dk.Talkgroup), slog.String("thread_id", tsThread))
 
-	// Roll the rescue's live interpretation forward. Best-effort and decoupled — if the
-	// LLM call or chat.update fails we still consider the TAC transmission processed (the
-	// per-message thread reply above is the canonical record). Uses parsedKey.dk.Time as
-	// the capture moment so the model sees stable timestamps even when pipeline latency
-	// varies between transmissions.
-	tc.updateLiveInterpretation(ctx, parsedKey.dk.Talkgroup, parsedKey.dk.Time, tr.Transcription)
+	// Roll the rescue's live interpretation forward with the CLEANED text. Best-effort and
+	// decoupled — if the LLM call or chat.update fails we still consider the TAC transmission
+	// processed (the per-message thread reply above is the canonical record). Uses
+	// parsedKey.dk.Time as the capture moment so the model sees stable timestamps even when
+	// pipeline latency varies between transmissions.
+	tc.updateLiveInterpretation(ctx, parsedKey.dk.Talkgroup, parsedKey.dk.Time, cleaned)
 	return nil
+}
+
+// maybeCleanTranscript runs the per-transmission LLM cleanup pass, returning a corrected
+// transcription. Gated by TAC_CLEANUP_ENABLED; when disabled (or on any error / empty result) it
+// returns the raw text unchanged so a transmission is never lost. The dispatch transcription and
+// (optional) CAD unit roster are passed as context so the model can disambiguate and canonicalize.
+func (tc *TranscribeClient) maybeCleanTranscript(ctx context.Context, tgid, raw string) string {
+	if !tc.config.TACCleanupEnabled {
+		return raw
+	}
+
+	// Bound the whole cleanup step (CAD lookup + LLM) with its own sub-context so a slow cleanup
+	// can't eat the worker budget the thread reply and live summary still need. Zero disables the
+	// sub-bound and falls back to the worker context + backend per-request timeout.
+	cleanCtx := ctx
+	if tc.config.TACCleanupTimeout > 0 {
+		var cancel context.CancelFunc
+		cleanCtx, cancel = context.WithTimeout(ctx, tc.config.TACCleanupTimeout)
+		defer cancel()
+	}
+
+	var dispatchText string
+	if meta, ok := tc.readClosureMeta(cleanCtx, tgid); ok {
+		dispatchText = meta.Transcription
+	}
+	unitContext := tc.unitContextFor(cleanCtx, tgid, dispatchText, time.Now())
+
+	res, err := tc.mlClient.CleanTACTranscript(cleanCtx, ml.TACCleanupInput{
+		Text:            raw,
+		DispatchContext: dispatchText,
+		UnitContext:     unitContext,
+	})
+	if err != nil {
+		slog.Warn("tac cleanup failed; posting raw transcription", slog.String("error", err.Error()), slog.String("tgid", tgid))
+		return raw
+	}
+	if res == nil || strings.TrimSpace(res.CleanedText) == "" {
+		return raw
+	}
+	return res.CleanedText
 }

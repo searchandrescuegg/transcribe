@@ -99,6 +99,16 @@ func (d *DragonflyClient) ZRem(ctx context.Context, key string, member string) (
 	return d.client.ZRem(dflyCtx, key, member).Result()
 }
 
+// ZScore returns the score of a member (redis.Nil error if absent). The live-interpretation
+// path uses it to read a TAC's current expiry from active_tacs when re-rendering the parent
+// alert mid-rescue, without threading the expiry through ClosureMeta.
+func (d *DragonflyClient) ZScore(ctx context.Context, key, member string) (float64, error) {
+	dflyCtx, cancel := context.WithTimeout(ctx, d.defaultTimeout)
+	defer cancel()
+
+	return d.client.ZScore(dflyCtx, key, member).Result()
+}
+
 // SRem and Del back the cancel-from-Slack flow: when leadership marks a TAC as a false
 // alarm, the controller must remove the talkgroup from the allow-list and drop the
 // per-talkgroup routing key in addition to ZRem'ing the pending closure.

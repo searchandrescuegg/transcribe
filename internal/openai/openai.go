@@ -10,6 +10,7 @@ import (
 	openai "github.com/sashabaranov/go-openai"
 	"github.com/sashabaranov/go-openai/jsonschema"
 	"github.com/searchandrescuegg/transcribe/internal/ml"
+	"github.com/searchandrescuegg/transcribe/internal/prompts"
 )
 
 // thinkBlockRE matches the chain-of-thought wrapper some reasoning-capable open-weights
@@ -33,9 +34,9 @@ func stripThinkingPrefix(content string) string {
 	return content
 }
 
-// unknownCallType is appended to any caller-supplied allowed-call-types list so the model
-// always has an escape hatch when it can't classify, instead of being forced to fabricate.
-const unknownCallType = "Unknown"
+// unknownCallType mirrors the shared fallback label so this package's tests can assert
+// against it without importing the prompts package.
+const unknownCallType = prompts.UnknownCallType
 
 type OpenAIClient struct {
 	client *openai.Client
@@ -86,7 +87,7 @@ func (oc *OpenAIClient) ParseRelevantInformationFromDispatchMessage(ctx context.
 	req := openai.ChatCompletionRequest{
 		Model: oc.model,
 		Messages: []openai.ChatCompletionMessage{
-			{Role: openai.ChatMessageRoleSystem, Content: oc.systemPrompt()},
+			{Role: openai.ChatMessageRoleSystem, Content: prompts.DispatchSystemPrompt(oc.allowedCallTypes)},
 			{Role: openai.ChatMessageRoleUser, Content: transcription},
 		},
 		ResponseFormat: &openai.ChatCompletionResponseFormat{
@@ -132,102 +133,10 @@ func (oc *OpenAIClient) ParseRelevantInformationFromDispatchMessage(ctx context.
 	return &dispatchMessages, nil
 }
 
-// systemPrompt returns the system prompt sent with each request. When allowedCallTypes is
-// non-empty the prompt is rewritten to reference the canonical list (the list itself is
-// inlined so the model knows the spelling and casing it MUST emit). When empty, the prompt
-// keeps the in-line examples for backward compatibility.
-func (oc *OpenAIClient) systemPrompt() string {
-	if len(oc.allowedCallTypes) == 0 {
-		return defaultSystemPrompt
-	}
-	// Use a clearly-delimited list so the model can't misinterpret comma-separated names
-	// that themselves contain commas (e.g. "Rescue - Trail, Mountain"). One per line.
-	var b strings.Builder
-	b.WriteString(constrainedSystemPromptHead)
-	b.WriteString("\nThe call_type field MUST be exactly one of the following (case-sensitive):\n")
-	for _, ct := range oc.allowedCallTypes {
-		b.WriteString("- ")
-		b.WriteString(ct)
-		b.WriteString("\n")
-	}
-	b.WriteString("- ")
-	b.WriteString(unknownCallType)
-	b.WriteString("\n")
-	b.WriteString(constrainedSystemPromptTail)
-	return b.String()
-}
-
-const defaultSystemPrompt = `You are a tool to accurately parse relevant information from a transcription of Fire Department radio messages.
-You will need to extract the call type and the tactical channel (TAC) from the transcription, including the FULL transcription.
-Please return the information in the defined format. There may be multiple calls within a single transcription, so if there are multiple calls, please identify and separate into multiple messages, but ensure they are deduplicated.
-Call types can include "Aid Emergency", "MVC", "MVC Aid Emergency", "AFA Commercial", "Rescue - Trail", etc.
-If the call type can not be determined, return "Unknown".
-The tactical channel (TAC) should be in the format "TAC1", "TAC2", etc. Do not include a space between "TAC" and the number. If it appears as SPFR Repeater, assume it is "TAC8".
-Please clean the transcription to update any misspellings, incorrect locations, and generally ensure that it is clear and concise.
-Do not add any additional information or context that is not present in the transcription.`
-
-const constrainedSystemPromptHead = `You are a tool to accurately parse relevant information from a transcription of Fire Department radio messages.
-You will need to extract the call type and the tactical channel (TAC) from the transcription, including the FULL transcription.
-Please return the information in the defined format. There may be multiple calls within a single transcription, so if there are multiple calls, please identify and separate into multiple messages, but ensure they are deduplicated.`
-
-const constrainedSystemPromptTail = `If the call type cannot be confidently mapped to one of the values listed above, return "Unknown".
-The tactical channel (TAC) should be in the format "TAC1", "TAC2", etc. Do not include a space between "TAC" and the number. If it appears as SPFR Repeater, assume it is "TAC8".
-Please clean the transcription to update any misspellings, incorrect locations, and generally ensure that it is clear and concise.
-Do not add any additional information or context that is not present in the transcription.`
-
-// buildSchema generates the response schema and, when allowedCallTypes is non-empty, post-
-// processes it to inject an `enum` constraint on the messages[].call_type field. With
-// `Strict: true` on the OpenAI side, this becomes a hard contract: the model can only emit
-// values from the enum, eliminating the prior need for fuzzy matching downstream.
+// buildSchema delegates to the shared prompts.DispatchSchema. It stays a method on
+// OpenAIClient so the package's schema regression tests can exercise it directly.
 func (oc *OpenAIClient) buildSchema() (*jsonschema.Definition, error) {
-	schema, err := jsonschema.GenerateSchemaForType(&ml.DispatchMessages{})
-	if err != nil {
-		return nil, err
-	}
-	if len(oc.allowedCallTypes) == 0 {
-		return schema, nil
-	}
-
-	enum := make([]string, 0, len(oc.allowedCallTypes)+1)
-	enum = append(enum, oc.allowedCallTypes...)
-	enum = append(enum, unknownCallType)
-
-	// Walk to messages[].call_type. As of go-openai v1.41+, GenerateSchemaForType
-	// emits a `$ref` into a `$defs` table for nested struct types instead of inlining
-	// Properties on Items. Resolve the ref so the enum patches the right node — and
-	// keep the legacy inline path so older library versions still work.
-	messagesProp, ok := schema.Properties["messages"]
-	if !ok {
-		return nil, fmt.Errorf("schema missing expected `messages` property; library shape changed?")
-	}
-	if messagesProp.Items == nil {
-		return nil, fmt.Errorf("schema `messages` has no Items definition; library shape changed?")
-	}
-
-	const dispatchMessageRef = "#/$defs/DispatchMessage"
-	if messagesProp.Items.Ref == dispatchMessageRef {
-		def, ok := schema.Defs["DispatchMessage"]
-		if !ok {
-			return nil, fmt.Errorf("schema `$defs.DispatchMessage` not found; library shape changed?")
-		}
-		callType, ok := def.Properties["call_type"]
-		if !ok {
-			return nil, fmt.Errorf("schema `$defs.DispatchMessage.call_type` not found; library shape changed?")
-		}
-		callType.Enum = enum
-		def.Properties["call_type"] = callType
-		schema.Defs["DispatchMessage"] = def
-		return schema, nil
-	}
-
-	callType, ok := messagesProp.Items.Properties["call_type"]
-	if !ok {
-		return nil, fmt.Errorf("schema `messages.call_type` not found; library shape changed?")
-	}
-	callType.Enum = enum
-	messagesProp.Items.Properties["call_type"] = callType
-	schema.Properties["messages"] = messagesProp
-	return schema, nil
+	return prompts.DispatchSchema(oc.allowedCallTypes)
 }
 
 // SummarizeRescue turns a dispatch + ordered TAC transcripts into a structured RescueSummary.
@@ -235,26 +144,25 @@ func (oc *OpenAIClient) buildSchema() (*jsonschema.Definition, error) {
 // chat_template_kwargs.enable_thinking flag and post-hoc <think>-stripping are inherited
 // because they apply to the OpenAI client, not per-method.
 //
-// Iterating on the prompt: the heart of this method is `rescueSummarySystemPrompt` below.
-// Edit that string to tune the model's behavior, then re-run the iteration CLI
-// (cmd/test-summary). The structured output schema is generated from the
+// Iterating on the prompt: edit prompts.RescueSummarySystemPrompt and re-run the iteration
+// CLI (cmd/test-summary). The structured output schema is generated from the
 // ml.RescueSummary struct, so renaming fields there propagates automatically.
 func (oc *OpenAIClient) SummarizeRescue(ctx context.Context, input ml.RescueSummaryInput) (*ml.RescueSummary, error) {
 	if input.DispatchTranscription == "" && len(input.TACTranscripts) == 0 {
 		return nil, fmt.Errorf("no transcripts to summarize")
 	}
 
-	schema, err := jsonschema.GenerateSchemaForType(&ml.RescueSummary{})
+	schema, err := prompts.RescueSummarySchema()
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate summary schema: %w", err)
 	}
 
-	userPrompt := buildRescueSummaryUserPrompt(input)
+	userPrompt := prompts.BuildRescueSummaryUserPrompt(input)
 
 	req := openai.ChatCompletionRequest{
 		Model: oc.model,
 		Messages: []openai.ChatCompletionMessage{
-			{Role: openai.ChatMessageRoleSystem, Content: rescueSummarySystemPrompt},
+			{Role: openai.ChatMessageRoleSystem, Content: prompts.RescueSummarySystemPrompt},
 			{Role: openai.ChatMessageRoleUser, Content: userPrompt},
 		},
 		ResponseFormat: &openai.ChatCompletionResponseFormat{
@@ -293,54 +201,56 @@ func (oc *OpenAIClient) SummarizeRescue(ctx context.Context, input ml.RescueSumm
 	return &summary, nil
 }
 
-// rescueSummarySystemPrompt is the canonical instruction the model gets every time. Iterate
-// on this string to tune the summary's voice, completeness, and accuracy. Pair edits with
-// runs of cmd/test-summary against fixture inputs to see the effect.
-const rescueSummarySystemPrompt = `You are an emergency-response analyst summarizing radio chatter from a US fire department's tactical channel during an in-progress rescue.
-
-You will receive:
-  - The original dispatch transcription that initiated the rescue (anchors what kind of incident this is).
-  - The dispatched call type (e.g. "Rescue - Trail") and the assigned tactical channel (e.g. "TAC10").
-  - An ordered list of TAC channel transmissions (one per radio key-up), each with a capture timestamp.
-
-Produce a structured summary that lets a human responder catch up at a glance. Follow these rules strictly:
-
-1. Be concise and factual. Do not speculate about details not stated in the transcripts.
-2. The transcripts come from imperfect speech-to-text. Normalize obvious mistakes: "Italian one seventy one" → "Battalion 171"; "Mabel Valley" → "Maple Valley"; numeric units like "8171" likely mean Battalion 8171 or Engine 8171 — preserve as written if context is ambiguous.
-3. Headline: one short sentence (≤ 80 chars) capturing the situation as it currently stands. Aim for what the on-call would want to know first.
-4. SituationSummary: 1–3 sentences. What's the incident, where, who's responding, what's happening operationally.
-5. Location: name the best-known location from the chatter (trailhead, address, mile marker). Empty string if not stated.
-6. UnitsInvolved: list every responding unit mentioned (e.g. "Engine 8171", "Aid 151", "Battalion 171", "Medic 104"). Deduplicate. Use the canonical form, not the spoken form.
-7. PatientStatus: one short phrase about patient condition or transport ("ambulatory; refused transport", "transported to Overlake", "no patient contact"). Empty if unstated.
-8. Outcome: short phrase. Choose the most accurate from the chatter: "Ongoing", "Resolved — patient transported", "Cancelled en route", "False alarm", "Resources canceled by IC", etc. If transcripts mention units being canceled or "code 4 / wave-firm canceled", treat that as a resolution.
-9. KeyEvents: an ordered list of notable moments with their CapturedAt timestamp from the transmission. Examples: "13:24:00 — Engine 8171 arrived on scene", "13:25:30 — Patient reached, ambulatory", "13:27:15 — Maple Valley resources canceled". Aim for 3–8 events; skip small acknowledgements ("copy", "171 received").
-10. If the transcripts are too sparse to populate a field, return an empty string (or empty list for arrays) rather than fabricating.`
-
-// buildRescueSummaryUserPrompt formats the input as a clearly-delimited block. The model
-// performs better when the dispatch and TAC sections are explicitly labeled.
-func buildRescueSummaryUserPrompt(input ml.RescueSummaryInput) string {
-	var b strings.Builder
-	b.WriteString("=== DISPATCH ===\n")
-	if input.DispatchCallType != "" || input.TACChannel != "" {
-		b.WriteString(fmt.Sprintf("Call type: %s\n", emptyAsDash(input.DispatchCallType)))
-		b.WriteString(fmt.Sprintf("TAC channel: %s\n", emptyAsDash(input.TACChannel)))
-		b.WriteString("\n")
+// CleanTACTranscript rewrites one raw TAC transmission into a clean, faithful transcription using
+// the same structured-output + <think>-stripping discipline as the other calls.
+func (oc *OpenAIClient) CleanTACTranscript(ctx context.Context, in ml.TACCleanupInput) (*ml.TACCleanupResult, error) {
+	if in.Text == "" {
+		return nil, fmt.Errorf("transcription cannot be empty")
 	}
-	b.WriteString("Transcript:\n")
-	b.WriteString(input.DispatchTranscription)
-	b.WriteString("\n\n=== TAC TRANSMISSIONS (chronological) ===\n")
-	if len(input.TACTranscripts) == 0 {
-		b.WriteString("(none yet)\n")
-	}
-	for i, t := range input.TACTranscripts {
-		b.WriteString(fmt.Sprintf("[%d] %s — %s\n", i+1, emptyAsDash(t.CapturedAt), t.Text))
-	}
-	return b.String()
-}
 
-func emptyAsDash(s string) string {
-	if s == "" {
-		return "—"
+	schema, err := prompts.TACCleanupSchema()
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate cleanup schema: %w", err)
 	}
-	return s
+
+	req := openai.ChatCompletionRequest{
+		Model: oc.model,
+		Messages: []openai.ChatCompletionMessage{
+			{Role: openai.ChatMessageRoleSystem, Content: prompts.TACCleanupSystemPrompt},
+			{Role: openai.ChatMessageRoleUser, Content: prompts.BuildTACCleanupUserPrompt(in)},
+		},
+		ResponseFormat: &openai.ChatCompletionResponseFormat{
+			Type: openai.ChatCompletionResponseFormatTypeJSONSchema,
+			JSONSchema: &openai.ChatCompletionResponseFormatJSONSchema{
+				Name:   "tac_cleanup",
+				Schema: schema,
+				Strict: true,
+			},
+		},
+	}
+	if !oc.enableThinking {
+		req.ChatTemplateKwargs = map[string]any{"enable_thinking": false}
+	}
+
+	resp, err := oc.client.CreateChatCompletion(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("tac cleanup chat completion: %w", err)
+	}
+	if len(resp.Choices) == 0 {
+		return nil, fmt.Errorf("no response choices returned from OpenAI")
+	}
+	content := resp.Choices[0].Message.Content
+	if content == "" {
+		return nil, fmt.Errorf("empty response content from OpenAI")
+	}
+	cleaned := stripThinkingPrefix(content)
+	if cleaned == "" {
+		return nil, fmt.Errorf("response content was nothing but reasoning prose: %s", content)
+	}
+
+	var result ml.TACCleanupResult
+	if err := json.Unmarshal([]byte(cleaned), &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal cleanup result: %w, cleaned content: %s, raw content: %s", err, cleaned, content)
+	}
+	return &result, nil
 }

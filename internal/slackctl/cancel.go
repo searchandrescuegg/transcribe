@@ -28,6 +28,10 @@ const (
 	summaryLockKeyFmt    = "summary_lock:%s"
 	summaryStaleKeyFmt   = "summary_stale:%s"
 	summaryDataKeyFmt    = "summary_data:%s"
+	// pulpoUnitsKeyFmt caches the CAD unit-context block; mirror of the constant in
+	// internal/transcribe/unit_context.go. Cleared here so a reopened rescue doesn't inherit a
+	// stale unit roster.
+	pulpoUnitsKeyFmt = "pulpo_units:%s"
 )
 
 // CancelTAC performs the state mutations for a Cancel / False Alarm action. It is
@@ -78,6 +82,7 @@ func (c *Controller) CancelTAC(ctx context.Context, tgid string) (meta transcrib
 		fmt.Sprintf(summaryLockKeyFmt, tgid),
 		fmt.Sprintf(summaryStaleKeyFmt, tgid),
 		fmt.Sprintf(summaryDataKeyFmt, tgid),
+		fmt.Sprintf(pulpoUnitsKeyFmt, tgid),
 	); err != nil {
 		return meta, false, fmt.Errorf("del closure sidecars: %w", err)
 	}

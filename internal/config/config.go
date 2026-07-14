@@ -58,11 +58,70 @@ type Config struct {
 	ASREndpoint string        `env:"ASR_ENDPOINT" envDefault:"http://localhost:8080/asr"`
 	ASRTimeout  time.Duration `env:"ASR_TIMEOUT" envDefault:"10s"` // Timeout for ASR requests in seconds
 
+	// MLBackend selects which ML provider implements transcribe.MLClient: "openai" (the
+	// OpenAI-compatible chat-completions path, also usable with Ollama/vLLM/LiteLLM) or
+	// "anthropic" (first-party Anthropic API with native structured outputs). Defaults to
+	// "openai" for backward compatibility with existing deployments.
+	MLBackend string `env:"ML_BACKEND" envDefault:"openai"`
+
 	// OpenAI Configuration
 	OpenAIAPIKey  string        `env:"OPENAI_API_KEY"`                                         // OpenAI API Key
 	OpenAIBaseURL string        `env:"OPENAI_BASE_URL" envDefault:"https://api.openai.com/v1"` // OpenAI API Base URL
 	OpenAIModel   string        `env:"OPENAI_MODEL" envDefault:"gpt-4"`                        // OpenAI Model to use
 	OpenAITimeout time.Duration `env:"OPENAI_TIMEOUT" envDefault:"30s"`                        // Timeout for OpenAI requests in seconds
+
+	// Anthropic Configuration (used when ML_BACKEND=anthropic).
+	//
+	// AnthropicBaseURL is optional; empty uses the SDK default. AnthropicDispatchModel runs
+	// the high-volume dispatch classifier (cheap model) and AnthropicSummaryModel runs the
+	// lower-volume rescue summaries (stronger model). Keep AnthropicTimeout <= WorkerTimeout
+	// (CLAUDE.md invariant #7).
+	AnthropicAPIKey        string `env:"ANTHROPIC_API_KEY"`
+	AnthropicBaseURL       string `env:"ANTHROPIC_BASE_URL"`
+	AnthropicDispatchModel string `env:"ANTHROPIC_DISPATCH_MODEL" envDefault:"claude-haiku-4-5"`
+	AnthropicSummaryModel  string `env:"ANTHROPIC_SUMMARY_MODEL" envDefault:"claude-sonnet-5"`
+	// AnthropicCleanupModel runs the per-transmission TAC cleanup. Defaults to the cheap/fast
+	// dispatch-tier model (high volume); bump it to a stronger model (e.g. claude-sonnet-5) if
+	// cleanup under-corrects hard callsigns / phrasing, at higher cost + latency per transmission.
+	AnthropicCleanupModel string        `env:"ANTHROPIC_CLEANUP_MODEL" envDefault:"claude-haiku-4-5"`
+	AnthropicTimeout      time.Duration `env:"ANTHROPIC_TIMEOUT" envDefault:"30s"`
+	AnthropicMaxTokens    int64         `env:"ANTHROPIC_MAX_TOKENS" envDefault:"2048"`
+
+	// TACCleanupEnabled turns on the per-transmission LLM cleanup pass: every TAC transmission
+	// is rewritten by the ML backend (fixing ASR errors, place names, and unit callsigns) before
+	// it is posted to the Slack thread and fed into the live summary. Best-effort — on any error
+	// the raw ASR text is used. Set to false to skip the extra LLM call per transmission and post
+	// raw ASR (the pre-feature behavior).
+	TACCleanupEnabled bool `env:"TAC_CLEANUP_ENABLED" envDefault:"true"`
+
+	// TACCleanupTimeout bounds the cleanup call (LLM + any CAD lookup) with its own sub-context so
+	// it can't consume the whole WorkerTimeout budget and starve the canonical thread reply and the
+	// live-summary call that follow it in the same worker. Keep it comfortably below WorkerTimeout
+	// minus the summary round-trip. Zero disables the sub-bound (cleanup then only bounded by the
+	// worker context + the backend's own per-request timeout).
+	TACCleanupTimeout time.Duration `env:"TAC_CLEANUP_TIMEOUT" envDefault:"20s"`
+
+	// Pulpo / PulsePoint CAD enrichment (optional). When PulpoEnabled is true the service queries
+	// the dispatch API for the units assigned to the active rescue and feeds that roster into the
+	// cleanup and summary prompts so garbled unit callsigns can be canonicalized. Entirely
+	// best-effort — a slow or unavailable API degrades to empty unit context, never blocking the
+	// pipeline. PulpoBaseURL, PulpoAPIKey, and PulpoAgencyID are required when enabled.
+	// PulpoRefreshInterval doubles as the TTL of the per-rescue cached unit block, so the roster
+	// self-refreshes as units are added over the life of the incident.
+	PulpoEnabled         bool          `env:"PULPO_ENABLED" envDefault:"false"`
+	PulpoBaseURL         string        `env:"PULPO_BASE_URL"`
+	PulpoAPIKey          string        `env:"PULPO_API_KEY"`
+	PulpoAgencyID        string        `env:"PULPO_AGENCY_ID"`
+	PulpoTimeout         time.Duration `env:"PULPO_TIMEOUT" envDefault:"5s"`
+	PulpoRefreshInterval time.Duration `env:"PULPO_REFRESH_INTERVAL" envDefault:"45s"`
+
+	// Dataset capture (optional). When DatasetEnabled is true the service records every ASR
+	// transcription and LLM interaction to Postgres for offline prompt refinement. Capture is
+	// fully best-effort — a slow or missing database drops records rather than affecting the
+	// pipeline. DatasetPostgresURL is required when enabled.
+	DatasetEnabled     bool   `env:"DATASET_ENABLED" envDefault:"false"`
+	DatasetPostgresURL string `env:"DATASET_POSTGRES_URL"`
+	DatasetBufferSize  int    `env:"DATASET_BUFFER_SIZE" envDefault:"1000"`
 
 	// When false (default), the request includes
 	// chat_template_kwargs: {"enable_thinking": false} which Qwen3-family chat templates

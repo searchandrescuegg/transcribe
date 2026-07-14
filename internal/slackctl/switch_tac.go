@@ -97,6 +97,7 @@ func (c *Controller) SwitchTAC(ctx context.Context, oldTGID, newTGID string) (ne
 		fmt.Sprintf(summaryLockKeyFmt, oldTGID),
 		fmt.Sprintf(summaryStaleKeyFmt, oldTGID),
 		fmt.Sprintf(summaryDataKeyFmt, oldTGID),
+		fmt.Sprintf(pulpoUnitsKeyFmt, oldTGID),
 	); err != nil {
 		return transcribe.ClosureMeta{}, time.Time{}, false, fmt.Errorf("del old closure sidecars: %w", err)
 	}
