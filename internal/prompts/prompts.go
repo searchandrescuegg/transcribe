@@ -54,6 +54,7 @@ You will need to extract the call type and the tactical channel (TAC) from the t
 Please return the information in the defined format. There may be multiple calls within a single transcription, so if there are multiple calls, please identify and separate into multiple messages, but ensure they are deduplicated.
 Call types can include "Aid Emergency", "MVC", "MVC Aid Emergency", "AFA Commercial", "Rescue - Trail", etc.
 If the call type can not be determined, return "Unknown".
+When the dispatch announces a "Rescue Trail" (a trail, wilderness, or hiker rescue — often "Rescue Trail TAC N"), classify it specifically as the trail-rescue call type ("Rescue - Trail"), NOT a generic rescue type like "Rescue - General". This distinction routes real trail rescues, so err toward "Rescue - Trail" whenever "Rescue Trail" is spoken.
 The tactical channel (TAC) should be in the format "TAC1", "TAC2", etc. Do not include a space between "TAC" and the number. If it appears as SPFR Repeater, assume it is "TAC8".
 Please clean the transcription to update any misspellings, incorrect locations, and generally ensure that it is clear and concise.
 Do not add any additional information or context that is not present in the transcription.`
@@ -63,6 +64,7 @@ You will need to extract the call type and the tactical channel (TAC) from the t
 Please return the information in the defined format. There may be multiple calls within a single transcription, so if there are multiple calls, please identify and separate into multiple messages, but ensure they are deduplicated.`
 
 const constrainedSystemPromptTail = `If the call type cannot be confidently mapped to one of the values listed above, return "Unknown".
+When the dispatch announces a "Rescue Trail" (a trail, wilderness, or hiker rescue — often "Rescue Trail TAC N"), classify it specifically as the trail-rescue call type (the listed value containing both "Rescue" and "Trail"), NOT a generic rescue type. This distinction routes real trail rescues, so err toward the trail-rescue value whenever "Rescue Trail" is spoken.
 The tactical channel (TAC) should be in the format "TAC1", "TAC2", etc. Do not include a space between "TAC" and the number. If it appears as SPFR Repeater, assume it is "TAC8".
 Please clean the transcription to update any misspellings, incorrect locations, and generally ensure that it is clear and concise.
 Do not add any additional information or context that is not present in the transcription.`
