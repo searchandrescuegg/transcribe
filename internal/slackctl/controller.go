@@ -144,6 +144,8 @@ func (c *Controller) dispatch(evt *socketmode.Event, client *socketmode.Client) 
 			c.handleExtend(ctx, payload, action)
 		case transcribe.ActionIDRescueSwitchTAC:
 			c.handleSwitchTAC(ctx, payload, action)
+		case transcribe.ActionIDRescueDelete:
+			c.handleDelete(ctx, payload, action)
 		case transcribe.ActionIDFeedbackForm:
 			// URL buttons fire a block_actions event AND open the link client-side — Slack
 			// sends both. We have nothing to do server-side; this case exists only to

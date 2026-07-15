@@ -260,6 +260,52 @@ func (s *DispatchSuite) TestProcessDispatchCall_NoTrailRescue_IsNoOp() {
 	s.EqualValues(0, count)
 }
 
+// A second tone-out for a TAC that already has an active rescue must NOT post a new alert or
+// steal the routing key — it's an additional unit on the same incident. It posts one thread reply
+// to the ORIGINAL thread and refreshes the window.
+func (s *DispatchSuite) TestProcessDispatchCall_AdditionalTone_DedupsToExistingThread() {
+	slackMock := new(mockSlackPoster)
+	mlMock := new(mockMLClient)
+	tc := s.newClientUnderTest(slackMock, mlMock)
+
+	tgid := talkgroupFromRadioShortCode["TAC1"].TGID
+	// Seed an already-active rescue on TAC1 (original alert thread = "orig-thread").
+	meta := ClosureMeta{TGID: tgid, TACChannel: "TAC1", ThreadTS: "orig-thread", SourceTalkgroup: FireDispatch1TGID, MessageTS: "orig-thread", Transcription: "original dispatch"}
+	payload, _ := json.Marshal(meta)
+	s.Require().NoError(tc.dragonflyClient.Set(s.ctx, fmt.Sprintf(tacMetaKeyFmt, tgid), 1*time.Hour, string(payload)))
+	s.Require().NoError(tc.dragonflyClient.Set(s.ctx, fmt.Sprintf(talkgroupKeyPrefix, tgid), 1*time.Hour, "orig-thread"))
+
+	mlMock.On("ParseRelevantInformationFromDispatchMessage", mock.Anything, "raw2").Return(
+		dispatchMessages(ml.DispatchMessage{CallType: "Rescue - Trail", TACChannel: "TAC1", CleanedTranscription: "additional unit"}), nil)
+	// Exactly ONE Slack post — the thread reply. A second (new-alert) post would fail .Once().
+	slackMock.On("SendMessageContext", mock.Anything, "C-TEST", mock.Anything).Return("C-TEST", "reply-ts", "", nil).Once()
+
+	parsed := &AdornedDeconstructedKey{dk: &DeconstructedKey{Talkgroup: FireDispatch1TGID, Time: time.Now()}}
+	err := tc.processDispatchCall(s.ctx, parsed, stubASRResponse("raw2"))
+	s.Require().NoError(err)
+
+	mlMock.AssertExpectations(s.T())
+	slackMock.AssertExpectations(s.T())
+
+	// Routing must still point at the ORIGINAL thread — the re-page did not steal it.
+	thread, err := tc.dragonflyClient.Get(s.ctx, fmt.Sprintf(talkgroupKeyPrefix, tgid))
+	s.Require().NoError(err)
+	s.Equal("orig-thread", thread, "additional tone-out must not overwrite routing to a new thread")
+
+	// tac_meta unchanged (still the original alert message).
+	metaAfter, ok := tc.readClosureMeta(s.ctx, tgid)
+	s.Require().True(ok)
+	s.Equal("orig-thread", metaAfter.MessageTS)
+
+	// Window refreshed: allow-list membership + a pending closure in the ZSET.
+	isMember, err := tc.dragonflyClient.SMisMember(s.ctx, "allowed_talkgroups", tgid)
+	s.Require().NoError(err)
+	s.Equal([]bool{true}, isMember)
+	zcount, err := s.rdb.ZCard(s.ctx, activeTACsKey).Result()
+	s.Require().NoError(err)
+	s.EqualValues(1, zcount)
+}
+
 func (s *DispatchSuite) TestProcessDispatchCall_UnknownTACChannel_ReturnsError() {
 	slackMock := new(mockSlackPoster)
 	mlMock := new(mockMLClient)

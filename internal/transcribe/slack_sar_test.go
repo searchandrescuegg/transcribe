@@ -55,6 +55,15 @@ func TestBuildRescueTrailBlocks_SARNotifiedBadge(t *testing.T) {
 	})
 }
 
+func TestBuildAdditionalDispatchBlocks(t *testing.T) {
+	blocks := transcribe.BuildAdditionalDispatchBlocks(
+		"TAC8", "Rescue Trail TAC 8 additional engine 171", time.Date(2026, 7, 15, 14, 30, 0, 0, time.UTC))
+	got := marshalBlocks(t, blocks)
+	assert.Contains(t, got, "Additional dispatch", "reply must flag it as an additional dispatch, not a new rescue")
+	assert.Contains(t, got, "TAC8")
+	assert.Contains(t, got, "additional engine 171", "reply carries the re-page transcription")
+}
+
 func TestBuildLiveInterpretationBlocks_SARNotifiedBadge(t *testing.T) {
 	updated := time.Date(2026, 7, 9, 10, 15, 0, 0, time.UTC)
 

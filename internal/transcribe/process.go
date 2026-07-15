@@ -76,6 +76,15 @@ func (tc *TranscribeClient) processDispatchCall(ctx context.Context, parsedKey *
 		return fmt.Errorf("%w: %s", ErrFailedToFindTalkgroup, dispatchMessage.TACChannel)
 	}
 
+	// DEDUP (same-incident re-page): if this TAC already has an active rescue, this tone-out is
+	// an additional unit paged onto the SAME incident — not a new rescue. Posting a fresh alert
+	// here would overwrite the tg:<TGID> routing key, stealing TAC traffic + live interpretation
+	// away from the original thread and orphaning it (with no safe way to act on the old alert).
+	// Instead, refresh the activation window and note the re-page in the existing thread.
+	if meta, active := tc.readClosureMeta(ctx, tg.TGID); active {
+		return tc.handleAdditionalDispatch(ctx, parsedKey, tr, meta)
+	}
+
 	err = tc.dragonflyClient.SAddEx(ctx, "allowed_talkgroups", tc.config.TacticalChannelActivationDuration, tg.TGID)
 	if err != nil {
 		return fmt.Errorf("%w: %s", ErrFailedToAddTalkgroupToAllowlist, err.Error())
@@ -132,6 +141,43 @@ func (tc *TranscribeClient) processDispatchCall(ctx context.Context, parsedKey *
 		tc.resolveAndCacheUnitContext(ctx, tg.TGID, tr.Transcription, parsedKey.dk.Time)
 	}
 
+	return nil
+}
+
+// handleAdditionalDispatch processes a re-page for an already-active rescue: it refreshes the
+// activation window (a fresh tone-out means the incident is still going) and posts an
+// informational reply in the original rescue thread. It deliberately does NOT post a new alert or
+// touch tg:<TGID> beyond refreshing its TTL, so the original thread keeps ownership of the
+// incident. Best-effort throughout — the per-S3-key dedup guard means this audio won't be
+// reprocessed on redelivery, so we swallow errors (logging them) and ack rather than risk losing
+// the re-page entirely or double-posting the reply.
+func (tc *TranscribeClient) handleAdditionalDispatch(ctx context.Context, parsedKey *AdornedDeconstructedKey, tr *asr.TranscriptionResponse, meta ClosureMeta) error {
+	slog.Info("additional dispatch for an active rescue; deduping (no new alert)",
+		slog.String("tgid", meta.TGID), slog.String("tac_channel", meta.TACChannel), slog.String("thread", meta.ThreadTS))
+
+	expiresAt := time.Now().Add(tc.config.TacticalChannelActivationDuration).Local()
+
+	// Refresh the activation window: allow-list membership, routing TTL, and the auto-close.
+	if err := tc.dragonflyClient.SAddEx(ctx, "allowed_talkgroups", tc.config.TacticalChannelActivationDuration, meta.TGID); err != nil {
+		slog.Error("additional dispatch: failed to refresh allow-list", slog.String("error", err.Error()), slog.String("tgid", meta.TGID))
+	}
+	if err := tc.dragonflyClient.Set(ctx, fmt.Sprintf(talkgroupKeyPrefix, meta.TGID), tc.config.TacticalChannelActivationDuration, meta.ThreadTS); err != nil {
+		slog.Error("additional dispatch: failed to refresh routing key", slog.String("error", err.Error()), slog.String("tgid", meta.TGID))
+	}
+	// Reuse the ORIGINAL meta (thread_ts, message_ts, dispatch transcript) with the new expiry so
+	// the auto-close pushes out and the feedback prefill still reflects the initiating dispatch.
+	if err := tc.ScheduleTACClosure(ctx, meta, expiresAt); err != nil {
+		slog.Error("additional dispatch: failed to reschedule closure", slog.String("error", err.Error()), slog.String("tgid", meta.TGID))
+	}
+
+	// Note the re-page in the original thread so operators see the additional unit.
+	if _, err := tc.sendSlackWithRetry(ctx, parsedKey.dk.Talkgroup,
+		slack.MsgOptionBlocks(BuildAdditionalDispatchBlocks(meta.TACChannel, tr.Transcription, parsedKey.dk.Time)...),
+		slack.MsgOptionTS(meta.ThreadTS),
+		slack.MsgOptionAsUser(true),
+	); err != nil {
+		slog.Error("additional dispatch: failed to post thread reply", slog.String("error", err.Error()), slog.String("tgid", meta.TGID))
+	}
 	return nil
 }
 
