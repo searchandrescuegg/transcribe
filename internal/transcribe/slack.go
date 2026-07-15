@@ -59,6 +59,11 @@ const (
 	ActionIDRescueClose     = "rescue_close"
 	ActionIDRescueExtend    = "rescue_extend"
 	ActionIDRescueSwitchTAC = "rescue_switch_tac"
+	// ActionIDRescueDelete permanently removes the specific alert MESSAGE it was clicked on
+	// (chat.delete). If that message is the live alert it also tears the incident down (like
+	// Cancel, minus the tombstone); if it's an orphaned duplicate it only removes the message and
+	// leaves the live incident alone. Distinct from Cancel/Close, which leave a message behind.
+	ActionIDRescueDelete = "rescue_delete"
 	// ActionIDFeedbackForm is the action_id on the URL-style Submit Feedback button.
 	// Slack sends a block_actions event for URL buttons too (so engagement is trackable),
 	// but we have nothing server-side to do — the controller's switch handles it as a
@@ -269,9 +274,26 @@ func buildRescueActionsBlock(tacChannel, tacTGID string) slack.Block {
 
 	switchSelect := buildSwitchTACSelect(tacChannel)
 
+	// Delete: removes THIS alert message. Danger-styled + confirm because it's destructive and,
+	// on the live alert, also stops monitoring. The confirm can't know at render time whether the
+	// clicked message is the live alert or an orphaned duplicate, so it warns about both.
+	deleteBtn := slack.NewButtonBlockElement(
+		ActionIDRescueDelete,
+		tacTGID,
+		slack.NewTextBlockObject(slack.PlainTextType, "Delete message", true, false),
+	)
+	deleteBtn.Style = slack.StyleDanger
+	deleteBtn.Confirm = slack.NewConfirmationBlockObject(
+		slack.NewTextBlockObject(slack.PlainTextType, "Delete this alert message?", false, false),
+		slack.NewTextBlockObject(slack.PlainTextType,
+			"Permanently removes this message. If it's the live alert, this also STOPS monitoring for this rescue (allow-list + context cleared) — use Cancel/Close if you want a record left behind. If it's a duplicate/orphaned alert, only this message is removed. This cannot be undone.", false, false),
+		slack.NewTextBlockObject(slack.PlainTextType, "Delete message", false, false),
+		slack.NewTextBlockObject(slack.PlainTextType, "Keep it", false, false),
+	)
+
 	// block_id encodes the active TGID so the switch handler knows what to migrate FROM.
 	blockID := fmt.Sprintf("%s:%s", ActionsBlockIDPrefix, tacTGID)
-	return slack.NewActionBlock(blockID, cancelBtn, closeBtn, extendBtn, switchSelect)
+	return slack.NewActionBlock(blockID, cancelBtn, closeBtn, extendBtn, switchSelect, deleteBtn)
 }
 
 // buildSwitchTACSelect returns a static_select populated with TAC1-TAC10. Each option's
@@ -307,6 +329,32 @@ func buildSwitchTACSelect(currentTACChannel string) *slack.SelectBlockElement {
 		slack.NewTextBlockObject(slack.PlainTextType, "Keep current", false, false),
 	)
 	return sel
+}
+
+// BuildAdditionalDispatchBlocks renders the thread reply posted when a re-page (an additional
+// unit toned out) is deduped onto an already-active rescue. It lives in the original rescue
+// thread so operators see the extra dispatch without a second top-level alert.
+func BuildAdditionalDispatchBlocks(tacChannel, transcription string, at time.Time) []slack.Block {
+	return []slack.Block{
+		slack.NewSectionBlock(
+			slack.NewTextBlockObject(slack.MarkdownType,
+				fmt.Sprintf(":bell: *Additional dispatch* — another unit was toned out for this incident (%s) at %s.",
+					tacChannel, at.Local().Format("15:04 MST")),
+				false, false),
+			nil, nil,
+		),
+		slack.NewRichTextBlock(
+			"",
+			&slack.RichTextPreformatted{
+				RichTextSection: slack.RichTextSection{
+					Type:     slack.RTEPreformatted,
+					Elements: []slack.RichTextSectionElement{slack.NewRichTextSectionTextElement(transcription, nil)},
+				},
+				Border: 0,
+			},
+		),
+		slack.NewDividerBlock(),
+	}
 }
 
 type ThreadCommunicationBlocksInput struct {

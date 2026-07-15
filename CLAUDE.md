@@ -50,6 +50,8 @@ button opens a Google Form prefilled with incident context.
 | Additive live-interpretation summary: prev summary fed back as input | Stops key-event churn — the model EXTENDS its prior summary (preserve established KeyEvents, append new) instead of re-deriving from scratch each transmission. Prev summary read from the existing `summary_data` (no new key); missing/garbled prior degrades to the old full-rewrite behavior | `internal/prompts` (summary rule #12 + `renderPreviousSummary`), `ml.RescueSummaryInput.PreviousSummary`, `live_interpretation.go` (`runOneSummaryPass` reads `readSummaryData`) |
 | Per-transmission LLM cleanup of TAC traffic | Raw ASR TAC transmissions were posted verbatim; a dedicated (cheap-model) cleanup call fixes ASR errors, place names (gazetteer), and unit callsigns before the thread reply AND the summary. Best-effort with raw fallback; kill-switch `TAC_CLEANUP_ENABLED` | `internal/ml` (`TranscriptCleaner`), `internal/prompts` (`TACCleanupSystemPrompt`), both backends' `CleanTACTranscript`, `process.go` (`maybeCleanTranscript`) |
 | CAD (PulsePoint) unit enrichment behind an optional resolver | Feeds the units actually assigned to the call into cleanup + summary so garbled callsigns snap to real units. Fuzzy correlation (location + call-type + recency) with agency-roster fallback; entirely best-effort and flag-gated (`PULPO_ENABLED`). Cached per-rescue in `pulpo_units:<TGID>` | `internal/pulsepoint/` (Resolver, `selectUnitContext`, `UnitContext.PromptBlock`), `transcribe.UnitResolver`, `unit_context.go` (`unitContextFor`) |
+| Same-incident dispatch dedup keyed on active `tac_meta:<TGID>` | A TAC is one incident at a time, so a 2nd tone-out naming an already-active TAC is an additional unit, not a new rescue. `processDispatchCall` checks `readClosureMeta` before posting; if active it refreshes the window + posts a thread reply instead of a 2nd alert — which would overwrite `tg:<TGID>` and orphan the original thread. (Residual: near-simultaneous first tone-outs can still double-post; the "different times" case is covered.) | `process.go` (`handleAdditionalDispatch`), `slack.go` (`BuildAdditionalDispatchBlocks`) |
+| Delete button targets the clicked message, not `tac_meta.MessageTS` | Orphaned duplicates share a TGID with the live alert, so a TGID-keyed delete would nuke the live one. `rescue_delete` deletes `payload.Container.MessageTs` and only tears down state when that ts IS the live alert. | `slackctl/delete.go` |
 
 ---
 
@@ -147,7 +149,7 @@ visible at both layers).
 
 ## Slack interactivity model
 
-Four buttons + one URL button on every rescue alert (when `SLACK_APP_TOKEN` is configured):
+Five buttons + one URL button on every rescue alert (when `SLACK_APP_TOKEN` is configured):
 
 | Action ID | Type | Authorized? | Effect |
 |---|---|---|---|
@@ -155,6 +157,7 @@ Four buttons + one URL button on every rescue alert (when `SLACK_APP_TOKEN` is c
 | `rescue_close` | Button + confirm | Yes (allowlist) | Early end-of-rescue routed through the **same path as auto-expiry**: SREM allow-list + DEL routing inline (so TAC traffic stops immediately), then ZADD `active_tacs` with score=now-1 so the sweeper claims it on its next tick (~5s) and runs `postChannelClosed` + `updateAlertForClosure` (preserving `summary_data` for the feedback URL prefill) + sidecar cleanup |
 | `rescue_extend` | Button + confirm | Yes (allowlist) | Refresh all per-TGID TTLs to a fresh activation window |
 | `rescue_switch_tac` | Static-select + confirm | Yes (allowlist) | Migrate state from old TGID to new TGID; preserve thread_ts |
+| `rescue_delete` | Button (danger) + confirm | Yes (allowlist) | chat.delete **the specific clicked message** (`payload.Container.MessageTs`). Smart: if that ts == `tac_meta.MessageTS` it's the live alert → tear the incident down via `CancelTAC` (no tombstone) then delete; otherwise it's an orphan → delete the message only, live incident untouched. (`slackctl/delete.go`) |
 | `feedback_form` | URL button (closed alert only) | n/a | Opens Google Form client-side; controller no-ops the resulting `block_actions` event |
 
 Authorization: `SLACK_ALLOWED_USER_IDS` (comma-separated user IDs). Empty = deny all.
