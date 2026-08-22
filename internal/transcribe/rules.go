@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -92,4 +93,31 @@ func CallIsTrailRescue(calltype string) bool {
 		}
 	}
 	return false
+}
+
+// transcriptionSignalsTrailRescue reports whether the RAW dispatch transcription itself announces
+// a trail rescue ("Rescue Trail …" / "Trail Rescue …"), independent of how the LLM labeled the
+// call_type. This is the dispatcher's own words — the ground truth — and is used as a safety net
+// when the LLM classifier mislabels the rescue subtype (e.g. "Rescue - General"), which would
+// otherwise silently drop a real trail rescue (observed in prod 2026-07-15: a "Rescue Trail Tac 2"
+// dispatch was labeled "Rescue - General" and got no alert). Deliberately narrow — the adjacent
+// phrase — so it won't fire on unrelated calls that merely mention a trail somewhere.
+func transcriptionSignalsTrailRescue(transcription string) bool {
+	t := strings.ToLower(transcription)
+	return strings.Contains(t, "rescue trail") || strings.Contains(t, "trail rescue")
+}
+
+var tacInTextRE = regexp.MustCompile(`(?i)\btac\s*(\d{1,2})\b`)
+
+// tacChannelFromText extracts the first TAC channel (e.g. "TAC2") named in raw dispatch text,
+// returning "" when none is found or the number isn't a known TAC. Used by the trail-rescue safety
+// net when the LLM's parsed messages didn't carry a usable TAC channel.
+func tacChannelFromText(transcription string) string {
+	for _, m := range tacInTextRE.FindAllStringSubmatch(transcription, -1) {
+		candidate := "TAC" + m[1]
+		if _, ok := talkgroupFromRadioShortCode[candidate]; ok {
+			return candidate
+		}
+	}
+	return ""
 }

@@ -49,6 +49,38 @@ func selectTrailRescueMessage(dispatchMessages *ml.DispatchMessages, transcripti
 
 		return &dispatchMessage, hashStr
 	}
+
+	// SAFETY NET: the LLM classifier occasionally mislabels a trail rescue as another rescue
+	// subtype (e.g. "Rescue - General"), which the call_type checks above drop — leaving a real
+	// trail rescue with NO alert. If the raw transcription itself clearly announces a trail rescue,
+	// salvage it: prefer a TAC the LLM already parsed (it usually extracts the channel even when it
+	// mislabels the type), else pull the TAC from the transcription. A missed trail rescue is the
+	// worst failure mode for this service, so we err toward alerting.
+	if transcriptionSignalsTrailRescue(transcription) {
+		tac := ""
+		for _, dm := range dispatchMessages.Messages {
+			if _, ok := talkgroupFromRadioShortCode[dm.TACChannel]; ok {
+				tac = dm.TACChannel
+				break
+			}
+		}
+		if tac == "" {
+			tac = tacChannelFromText(transcription)
+		}
+		if tac != "" {
+			hashStr := fmt.Sprintf("%d", xxhash.Sum64([]byte(transcription)))
+			slog.Warn("trail rescue recovered by transcription safety net (LLM mislabeled the call type)",
+				slog.String("tac_channel", tac), slog.String("transcription", transcription))
+			return &ml.DispatchMessage{
+				CallType:             "Rescue - Trail",
+				TACChannel:           tac,
+				CleanedTranscription: transcription,
+			}, hashStr
+		}
+		slog.Error("transcription announces a trail rescue but no TAC channel could be determined; NOT alerting",
+			slog.String("transcription", transcription))
+	}
+
 	return nil, ""
 }
 
