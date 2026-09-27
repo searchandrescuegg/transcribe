@@ -46,6 +46,12 @@ type ClosureMeta struct {
 	// Stored so the sweeper can rebuild the alert blocks (preserving the transcript)
 	// when the auto-close fires and we need to remove the action buttons.
 	Transcription string `json:"transcription,omitempty"`
+	// DispatchCorrection is set when leadership corrected the dispatch transcription via the
+	// "Correct transcript" shortcut. Transcription then holds the corrected text; Original keeps
+	// what the ASR produced. Rendered as the "Corrected by" label on the alert.
+	DispatchCorrection *TranscriptCorrection `json:"dispatch_correction,omitempty"`
+	// DispatchS3Key is the audio object that produced the alert, for dataset joins.
+	DispatchS3Key string `json:"dispatch_s3_key,omitempty"`
 }
 
 // ScheduleTACClosure persists a pending channel-closed notification keyed by expiry time.

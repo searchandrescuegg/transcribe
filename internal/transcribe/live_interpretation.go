@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/searchandrescuegg/transcribe/internal/ml"
@@ -53,102 +54,111 @@ const (
 	// between RPush-during-lock and the lock holder's next stale-check. Beyond that the
 	// next transmission will retrigger the path naturally.
 	summaryStaleTTL = 60 * time.Second
+
+	// summary_stale values. "1" = a transmission arrived during the last pass, rerun additively.
+	// "rewrite" = an edit/retraction arrived, rerun WITHOUT the previous summary. A pending
+	// "rewrite" is never downgraded: plain losers use SETNX, rewrite losers use SET.
+	staleValueRerun   = "1"
+	staleValueRewrite = "rewrite"
 )
 
-// updateLiveInterpretation appends one TAC transcript and refreshes the rescue thread's
-// running summary. Best-effort: any failure logs and continues so the worker still acks the
-// underlying Pulsar message — the canonical record of what was said is the per-transmission
-// thread reply that processNonDispatchCall already posted.
-//
-// Concurrency model: when N transmissions arrive nearly simultaneously (synthetic trigger
-// burst, real-world heavy traffic), each worker:
-//  1. RPushes its transcript (everyone records, lossless).
-//  2. Tries to SetNX a per-TGID summary lock. Loser sets a stale flag and returns immediately
-//     — no LLM call, no Slack post.
-//  3. Winner runs the summarize-and-post loop, which re-summarizes whenever the stale flag
-//     was set during the last cycle. Net cost: ~2 LLM calls per burst regardless of N.
+// updateLiveInterpretation appends one radio transcript and refreshes the running summary.
+// Kept for callers/tests that only have text; processNonDispatchCall uses appendAndRefresh
+// directly so it can record the Slack post ts and S3 key.
 func (tc *TranscribeClient) updateLiveInterpretation(ctx context.Context, tacTGID string, capturedAt time.Time, transcript string) {
-	if transcript == "" {
-		return
-	}
-
-	listKey := transcriptsKey(tacTGID)
-	listTTL := tc.transcriptsTTL()
-	if err := tc.appendEntry(ctx, tacTGID, liveTranscriptEntry{
+	tc.appendAndRefresh(ctx, tacTGID, liveTranscriptEntry{
 		CapturedAt: capturedAt.Format("15:04:05"),
 		Text:       transcript,
 		Kind:       entryKindRadio,
-	}); err != nil {
-		slog.Warn("live interpretation: append failed", slog.String("error", err.Error()), slog.String("tgid", tacTGID))
+	})
+}
+
+// appendAndRefresh records one entry (lossless — every worker appends) then runs an additive
+// summary refresh. Best-effort: failures log and return.
+func (tc *TranscribeClient) appendAndRefresh(ctx context.Context, tgid string, e liveTranscriptEntry) {
+	if e.Text == "" {
 		return
 	}
+	if err := tc.appendEntry(ctx, tgid, e); err != nil {
+		slog.Warn("live interpretation: append failed", slog.String("error", err.Error()), slog.String("tgid", tgid))
+		return
+	}
+	tc.RefreshLiveInterpretation(ctx, tgid, false)
+}
 
-	// Try to take ownership of the LLM-and-post cycle. Losers mark the rescue stale and
-	// return — the existing lock holder will pick up our transcript on its next pass.
-	lockKey := fmt.Sprintf(summaryLockKeyFmt, tacTGID)
+// RefreshLiveInterpretation re-summarizes the rescue and posts/updates the Live Interpretation.
+// rewrite=true runs the first pass without the previous summary (used after a human edit or
+// retraction so facts derived from superseded text are re-derived).
+//
+// Concurrency model (unchanged from the original burst design): a per-TGID SETNX lock admits one
+// holder; losers leave a signal in summary_stale and return. The holder loops, consuming the
+// signal with GETDEL before each pass so a "rewrite" that lands mid-pass is never lost.
+func (tc *TranscribeClient) RefreshLiveInterpretation(ctx context.Context, tgid string, rewrite bool) {
+	lockKey := fmt.Sprintf(summaryLockKeyFmt, tgid)
+	staleKey := fmt.Sprintf(summaryStaleKeyFmt, tgid)
+
 	acquired, err := tc.dragonflyClient.SetNX(ctx, lockKey, summaryLockTTL, "1")
 	if err != nil {
-		slog.Warn("live interpretation: lock SetNX failed; skipping summary update", slog.String("error", err.Error()), slog.String("tgid", tacTGID))
+		slog.Warn("live interpretation: lock SetNX failed; skipping summary update", slog.String("error", err.Error()), slog.String("tgid", tgid))
 		return
 	}
 	if !acquired {
-		// Another worker is mid-summary. Mark stale so it knows to re-summarize when it
-		// finishes — guarantees our transcript ends up reflected in the displayed summary.
-		if err := tc.dragonflyClient.Set(ctx, fmt.Sprintf(summaryStaleKeyFmt, tacTGID), summaryStaleTTL, "1"); err != nil {
-			slog.Warn("live interpretation: failed to set stale flag", slog.String("error", err.Error()), slog.String("tgid", tacTGID))
-		}
+		tc.markSummaryStale(ctx, staleKey, rewrite, tgid)
 		return
 	}
 	defer func() {
 		if err := tc.dragonflyClient.Del(ctx, lockKey); err != nil {
-			slog.Warn("live interpretation: failed to release summary lock; will expire via TTL", slog.String("error", err.Error()), slog.String("tgid", tacTGID))
+			slog.Warn("live interpretation: failed to release summary lock; will expire via TTL", slog.String("error", err.Error()), slog.String("tgid", tgid))
 		}
 	}()
 
-	// Loop: each pass clears the stale flag, re-reads the full transcripts list, summarizes,
-	// and posts/updates Slack. If the stale flag got set during the work (another worker
-	// arrived), we go around again. Hard-cap iterations as belt-and-suspenders against any
-	// pathological loop where the flag is being toggled forever.
 	const maxIterations = 5
 	for i := 0; i < maxIterations; i++ {
-		if err := tc.dragonflyClient.Del(ctx, fmt.Sprintf(summaryStaleKeyFmt, tacTGID)); err != nil {
-			// Failure to clear isn't fatal — worst case we run an extra summarize.
-			slog.Warn("live interpretation: failed to clear stale flag", slog.String("error", err.Error()))
+		pending, err := tc.dragonflyClient.GetDel(ctx, staleKey)
+		if err != nil {
+			slog.Warn("live interpretation: failed to consume stale flag", slog.String("error", err.Error()))
 		}
-		if !tc.runOneSummaryPass(ctx, tacTGID, listKey, listTTL) {
-			// Pass returned false: rescue isn't live (no metadata) or unrecoverable error.
+		if pending == staleValueRewrite {
+			rewrite = true
+		}
+		if !tc.runOneSummaryPass(ctx, tgid, rewrite) {
 			return
 		}
-		stale, err := tc.dragonflyClient.Get(ctx, fmt.Sprintf(summaryStaleKeyFmt, tacTGID))
+		next, err := tc.dragonflyClient.Get(ctx, staleKey)
 		if err != nil {
 			slog.Warn("live interpretation: failed to read stale flag; assuming caught up", slog.String("error", err.Error()))
 			return
 		}
-		if stale != "1" {
-			return // No new transcripts arrived during our work — we're caught up.
+		if next == "" {
+			return
 		}
-		slog.Debug("live interpretation: stale flag set during summary; re-running", slog.String("tgid", tacTGID), slog.Int("iteration", i+1))
+		rewrite = false // the next iteration's GETDEL re-derives it from the pending value
+		slog.Debug("live interpretation: stale flag set during summary; re-running", slog.String("tgid", tgid), slog.Int("iteration", i+1))
 	}
-	slog.Warn("live interpretation: hit maxIterations; giving up to avoid infinite loop", slog.String("tgid", tacTGID))
+	slog.Warn("live interpretation: hit maxIterations; giving up to avoid infinite loop", slog.String("tgid", tgid))
+}
+
+func (tc *TranscribeClient) markSummaryStale(ctx context.Context, staleKey string, rewrite bool, tgid string) {
+	var err error
+	if rewrite {
+		err = tc.dragonflyClient.Set(ctx, staleKey, summaryStaleTTL, staleValueRewrite)
+	} else {
+		// SETNX so a pending "rewrite" is never downgraded to a plain rerun.
+		_, err = tc.dragonflyClient.SetNX(ctx, staleKey, summaryStaleTTL, staleValueRerun)
+	}
+	if err != nil {
+		slog.Warn("live interpretation: failed to set stale flag", slog.String("error", err.Error()), slog.String("tgid", tgid))
+	}
 }
 
 // runOneSummaryPass reads the full transcripts list, calls SummarizeRescue, and posts (or
 // chat.update's) the running interpretation message. Returns false on terminal failures
 // (no metadata, ML unrecoverable error) so the caller stops iterating.
-func (tc *TranscribeClient) runOneSummaryPass(ctx context.Context, tacTGID, listKey string, listTTL time.Duration) bool {
-	rawEntries, err := tc.dragonflyClient.LRange(ctx, listKey, 0, -1)
+func (tc *TranscribeClient) runOneSummaryPass(ctx context.Context, tacTGID string, rewrite bool) bool {
+	entries, err := tc.readEntries(ctx, tacTGID)
 	if err != nil {
 		slog.Warn("live interpretation: LRange failed", slog.String("error", err.Error()), slog.String("tgid", tacTGID))
 		return false
-	}
-	transcripts := make([]ml.TACTranscript, 0, len(rawEntries))
-	for _, raw := range rawEntries {
-		var e liveTranscriptEntry
-		if err := json.Unmarshal([]byte(raw), &e); err != nil {
-			slog.Warn("live interpretation: dropping unparseable transcript entry", slog.String("error", err.Error()))
-			continue
-		}
-		transcripts = append(transcripts, ml.TACTranscript{CapturedAt: e.CapturedAt, Text: e.Text})
 	}
 
 	meta, ok := tc.readClosureMeta(ctx, tacTGID)
@@ -156,22 +166,15 @@ func (tc *TranscribeClient) runOneSummaryPass(ctx context.Context, tacTGID, list
 		return false
 	}
 
-	// Additive context: feed the model its own PREVIOUS summary (if any) so it extends the
-	// established record rather than re-deriving it — this is what stops key events from churning
-	// between transmissions. A missing/unparseable prior summary simply degrades to a fresh
-	// (full-rewrite) pass. Also feed the CAD unit roster (empty when enrichment is off) so garbled
-	// callsigns can be canonicalized.
-	previousSummary, _ := tc.readSummaryData(ctx, tacTGID)
+	// Additive context (see rule 12) unless this pass is a rewrite after a human edit/retraction.
+	var previousSummary *ml.RescueSummary
+	if !rewrite {
+		previousSummary, _ = tc.readSummaryData(ctx, tacTGID)
+	}
 	unitContext := tc.unitContextFor(ctx, tacTGID, meta.Transcription, time.Now())
+	input := buildSummaryInput(meta, entries, previousSummary, unitContext)
 
-	summary, err := tc.mlClient.SummarizeRescue(ctx, ml.RescueSummaryInput{
-		DispatchTranscription: meta.Transcription,
-		DispatchCallType:      "Rescue - Trail",
-		TACChannel:            meta.TACChannel,
-		TACTranscripts:        transcripts,
-		PreviousSummary:       previousSummary,
-		UnitContext:           unitContext,
-	})
+	summary, err := tc.mlClient.SummarizeRescue(ctx, input)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			slog.Warn("live interpretation: shutdown interrupted summarize", slog.String("error", err.Error()))
@@ -181,12 +184,41 @@ func (tc *TranscribeClient) runOneSummaryPass(ctx context.Context, tacTGID, list
 		return false
 	}
 
-	tc.publishLiveInterpretation(ctx, tacTGID, meta, summary, listTTL)
+	tc.publishLiveInterpretation(ctx, tacTGID, meta, summary, tc.transcriptsTTL())
 	slog.Info("live interpretation: posted summary",
 		slog.String("tgid", tacTGID),
-		slog.Int("transcripts_count", len(transcripts)),
+		slog.Int("transcripts_count", len(input.TACTranscripts)), slog.Int("operator_corrections", len(input.OperatorCorrections)), slog.Bool("rewrite", rewrite),
 		slog.String("headline", summary.Headline))
 	return true
+}
+
+// buildSummaryInput turns the stored entries into the summarizer input: radio entries (with
+// human corrections applied and flagged) become TACTranscripts, live operator entries become
+// OperatorCorrections, and invalid/tombstoned entries are skipped.
+func buildSummaryInput(meta ClosureMeta, entries []liveTranscriptEntry, previous *ml.RescueSummary, unitContext string) ml.RescueSummaryInput {
+	in := ml.RescueSummaryInput{
+		DispatchTranscription: meta.Transcription,
+		DispatchCallType:      "Rescue - Trail",
+		TACChannel:            meta.TACChannel,
+		TACTranscripts:        make([]ml.TACTranscript, 0, len(entries)),
+		PreviousSummary:       previous,
+		UnitContext:           unitContext,
+		DispatchVerified:      meta.DispatchCorrection != nil,
+	}
+	for _, e := range entries {
+		switch e.kind() {
+		case entryKindRadio:
+			in.TACTranscripts = append(in.TACTranscripts, ml.TACTranscript{
+				CapturedAt: e.CapturedAt, Text: e.effectiveText(), Verified: e.Correction != nil,
+			})
+		case entryKindOperator:
+			if e.Deleted || strings.TrimSpace(e.Text) == "" {
+				continue
+			}
+			in.OperatorCorrections = append(in.OperatorCorrections, ml.OperatorCorrection{At: e.CapturedAt, Text: e.Text})
+		}
+	}
+	return in
 }
 
 // publishLiveInterpretation posts (or chat.updates) the running-summary message in the

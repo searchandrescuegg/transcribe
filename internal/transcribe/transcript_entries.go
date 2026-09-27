@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"time"
 )
 
@@ -79,6 +80,8 @@ func (tc *TranscribeClient) readEntries(ctx context.Context, tgid string) ([]liv
 	entries := make([]liveTranscriptEntry, len(raw))
 	for i, r := range raw {
 		if err := json.Unmarshal([]byte(r), &entries[i]); err != nil {
+			slog.Warn("live interpretation: unparseable transcript entry; keeping invalid placeholder",
+				slog.String("error", err.Error()), slog.String("tgid", tgid), slog.Int("index", i))
 			entries[i] = liveTranscriptEntry{Kind: entryKindInvalid}
 		}
 	}
