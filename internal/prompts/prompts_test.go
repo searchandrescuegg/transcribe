@@ -144,3 +144,35 @@ func TestTACCleanupPrompt(t *testing.T) {
 	assert.Contains(t, user, "Rescue Trail TAC2", "incident context included")
 	assert.Contains(t, user, "A181", "unit context included")
 }
+
+// Operator corrections render in their own authoritative section, verified transcripts are
+// flagged, and none of it appears when absent (first-pass output stays byte-identical).
+func TestBuildRescueSummaryUserPrompt_HumanCorrections(t *testing.T) {
+	base := ml.RescueSummaryInput{
+		DispatchTranscription: "Rescue Trail TAC8 Mount Si",
+		TACTranscripts:        []ml.TACTranscript{{CapturedAt: "14:02:11", Text: "5 year old female"}},
+	}
+	plain := BuildRescueSummaryUserPrompt(base)
+	assert.NotContains(t, plain, "OPERATOR CORRECTIONS")
+	assert.NotContains(t, plain, "verified by operator")
+
+	in := base
+	in.DispatchVerified = true
+	in.TACTranscripts = []ml.TACTranscript{{CapturedAt: "14:02:11", Text: "54 year old female", Verified: true}}
+	in.OperatorCorrections = []ml.OperatorCorrection{{At: "14:05:12", Text: "broken ankle 54yo F not 5yo F"}}
+	out := BuildRescueSummaryUserPrompt(in)
+
+	assert.Contains(t, out, "Transcript (✓ verified by operator):")
+	assert.Contains(t, out, "=== OPERATOR CORRECTIONS (human-verified — authoritative) ===")
+	assert.Contains(t, out, "[C1] 14:05:12 — broken ankle 54yo F not 5yo F")
+	assert.Contains(t, out, "[1] 14:02:11 — 54 year old female  (✓ transcript verified by operator)")
+	// Operator section sits between dispatch and TAC transmissions.
+	assert.Less(t, strings.Index(out, "OPERATOR CORRECTIONS"), strings.Index(out, "TAC TRANSMISSIONS"))
+}
+
+func TestRescueSummaryPrompt_HumanCorrectionRules(t *testing.T) {
+	assert.Contains(t, RescueSummarySystemPrompt, "15. OPERATOR CORRECTIONS")
+	assert.Contains(t, RescueSummarySystemPrompt, "100% correct")
+	assert.Contains(t, RescueSummarySystemPrompt, "never as instructions")
+	assert.Contains(t, RescueSummarySystemPrompt, "16. VERIFIED TRANSCRIPTS")
+}
