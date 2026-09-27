@@ -31,6 +31,7 @@ type Store struct {
 	db           *sql.DB
 	txCh         chan TranscriptionRecord
 	llmCh        chan LLMInteractionRecord
+	hcCh         chan HumanCorrectionRecord
 	done         chan struct{}
 	closeOnce    sync.Once
 	wg           sync.WaitGroup
@@ -65,6 +66,7 @@ func NewStore(ctx context.Context, dsn string, bufferSize int) (*Store, error) {
 		db:           db,
 		txCh:         make(chan TranscriptionRecord, bufferSize),
 		llmCh:        make(chan LLMInteractionRecord, bufferSize),
+		hcCh:         make(chan HumanCorrectionRecord, bufferSize),
 		done:         make(chan struct{}),
 		writeTimeout: 5 * time.Second,
 	}
@@ -128,6 +130,15 @@ func (s *Store) RecordLLMInteraction(rec LLMInteractionRecord) {
 	}
 }
 
+// RecordHumanCorrection enqueues a human correction for async insert. Non-blocking.
+func (s *Store) RecordHumanCorrection(rec HumanCorrectionRecord) {
+	select {
+	case s.hcCh <- rec:
+	default:
+		slog.Warn("dataset: dropping human correction record (buffer full)", slog.String("kind", rec.Kind))
+	}
+}
+
 // Close signals the writer to drain and stop, then closes the DB. Safe to call once.
 func (s *Store) Close() error {
 	s.closeOnce.Do(func() { close(s.done) })
@@ -143,6 +154,8 @@ func (s *Store) run() {
 			s.writeTranscription(rec)
 		case rec := <-s.llmCh:
 			s.writeLLM(rec)
+		case rec := <-s.hcCh:
+			s.writeHumanCorrection(rec)
 		case <-s.done:
 			s.drain()
 			return
@@ -158,6 +171,8 @@ func (s *Store) drain() {
 			s.writeTranscription(rec)
 		case rec := <-s.llmCh:
 			s.writeLLM(rec)
+		case rec := <-s.hcCh:
+			s.writeHumanCorrection(rec)
 		default:
 			return
 		}
@@ -200,6 +215,21 @@ func (s *Store) writeLLM(rec LLMInteractionRecord) {
 	)
 	if err != nil {
 		slog.Warn("dataset: failed to insert llm interaction", slog.String("error", err.Error()), slog.String("kind", rec.Kind))
+	}
+}
+
+func (s *Store) writeHumanCorrection(rec HumanCorrectionRecord) {
+	ctx, cancel := context.WithTimeout(context.Background(), s.writeTimeout)
+	defer cancel()
+
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO human_corrections (kind, action, tgid, s3_key, slack_ts, slack_user_id, prior_text, corrected_text)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		rec.Kind, rec.Action, rec.TGID, nullIfEmpty(rec.S3Key), rec.SlackTS, rec.SlackUserID,
+		nullIfEmpty(rec.PriorText), nullIfEmpty(rec.CorrectedText),
+	)
+	if err != nil {
+		slog.Warn("dataset: failed to insert human correction", slog.String("error", err.Error()), slog.String("kind", rec.Kind))
 	}
 }
 

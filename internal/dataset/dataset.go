@@ -45,11 +45,36 @@ type LLMInteractionRecord struct {
 	LatencyMS  int64
 }
 
+// Human-correction kinds and actions (values of human_corrections.kind / .action).
+const (
+	HumanCorrectionKindDispatch = "dispatch_transcript"
+	HumanCorrectionKindTAC      = "tac_transcript"
+	HumanCorrectionKindOperator = "operator_note"
+
+	HumanCorrectionActionCreate = "create"
+	HumanCorrectionActionEdit   = "edit"
+	HumanCorrectionActionDelete = "delete"
+)
+
+// HumanCorrectionRecord is one human edit from Slack: a transcript correction or a
+// `correction:` thread note (create / edit / delete).
+type HumanCorrectionRecord struct {
+	Kind          string
+	Action        string
+	TGID          string
+	S3Key         string // source audio for transcript corrections; empty for notes
+	SlackTS       string
+	SlackUserID   string
+	PriorText     string
+	CorrectedText string
+}
+
 // Recorder is the sink the pipeline writes to. Implementations MUST be non-blocking and
 // best-effort — a slow or unavailable backend must never stall the caller.
 type Recorder interface {
 	RecordTranscription(TranscriptionRecord)
 	RecordLLMInteraction(LLMInteractionRecord)
+	RecordHumanCorrection(HumanCorrectionRecord)
 	Close() error
 }
 
