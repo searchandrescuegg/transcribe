@@ -14,6 +14,9 @@ import (
 type AdornedDeconstructedKey struct {
 	dk *DeconstructedKey
 	ti *TalkgroupInformation
+	// key is the full S3 object key, carried so transcript entries and dataset rows can be
+	// joined back to the audio object.
+	key string
 }
 
 func (tc *TranscribeClient) IsObjectAllowed(ctx context.Context, key string) (bool, *AdornedDeconstructedKey, error) {
@@ -39,8 +42,9 @@ func (tc *TranscribeClient) IsObjectAllowed(ctx context.Context, key string) (bo
 	talkgroupInfo := talkgroupFromTGID[parsedKey.Talkgroup]
 
 	adk = &AdornedDeconstructedKey{
-		dk: parsedKey,
-		ti: &talkgroupInfo,
+		dk:  parsedKey,
+		ti:  &talkgroupInfo,
+		key: key,
 	}
 
 	res, err := tc.dragonflyClient.SMisMember(ctx, "allowed_talkgroups", adk.ti.TGID)

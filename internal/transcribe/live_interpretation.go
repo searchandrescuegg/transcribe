@@ -55,14 +55,6 @@ const (
 	summaryStaleTTL = 60 * time.Second
 )
 
-// liveTranscriptEntry is the per-RPush record. Capture time is what the model wires into
-// KeyEvents — pulled from the audio's filename timestamp, not when the transcription
-// finished (which would jitter with pipeline latency).
-type liveTranscriptEntry struct {
-	CapturedAt string `json:"captured_at"`
-	Text       string `json:"text"`
-}
-
 // updateLiveInterpretation appends one TAC transcript and refreshes the rescue thread's
 // running summary. Best-effort: any failure logs and continues so the worker still acks the
 // underlying Pulsar message — the canonical record of what was said is the per-transmission
@@ -80,9 +72,13 @@ func (tc *TranscribeClient) updateLiveInterpretation(ctx context.Context, tacTGI
 		return
 	}
 
-	listKey := fmt.Sprintf(tacTranscriptsKeyFmt, tacTGID)
-	listTTL := 2 * tc.config.TacticalChannelActivationDuration
-	if err := tc.appendTranscript(ctx, listKey, listTTL, capturedAt, transcript); err != nil {
+	listKey := transcriptsKey(tacTGID)
+	listTTL := tc.transcriptsTTL()
+	if err := tc.appendEntry(ctx, tacTGID, liveTranscriptEntry{
+		CapturedAt: capturedAt.Format("15:04:05"),
+		Text:       transcript,
+		Kind:       entryKindRadio,
+	}); err != nil {
 		slog.Warn("live interpretation: append failed", slog.String("error", err.Error()), slog.String("tgid", tacTGID))
 		return
 	}
@@ -134,26 +130,6 @@ func (tc *TranscribeClient) updateLiveInterpretation(ctx context.Context, tacTGI
 		slog.Debug("live interpretation: stale flag set during summary; re-running", slog.String("tgid", tacTGID), slog.Int("iteration", i+1))
 	}
 	slog.Warn("live interpretation: hit maxIterations; giving up to avoid infinite loop", slog.String("tgid", tacTGID))
-}
-
-// appendTranscript handles the RPush + Expire pair so the caller stays focused on the
-// concurrency policy. Re-stamps the TTL on every push so an active rescue's transcripts
-// list never expires under the rescue's feet.
-func (tc *TranscribeClient) appendTranscript(ctx context.Context, listKey string, listTTL time.Duration, capturedAt time.Time, transcript string) error {
-	encoded, err := json.Marshal(liveTranscriptEntry{
-		CapturedAt: capturedAt.Format("15:04:05"),
-		Text:       transcript,
-	})
-	if err != nil {
-		return fmt.Errorf("marshal transcript entry: %w", err)
-	}
-	if err := tc.dragonflyClient.RPush(ctx, listKey, string(encoded)); err != nil {
-		return fmt.Errorf("RPush: %w", err)
-	}
-	if err := tc.dragonflyClient.Expire(ctx, listKey, listTTL); err != nil {
-		return fmt.Errorf("expire: %w", err)
-	}
-	return nil
 }
 
 // runOneSummaryPass reads the full transcripts list, calls SummarizeRescue, and posts (or

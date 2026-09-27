@@ -151,3 +151,28 @@ func (d *DragonflyClient) Expire(ctx context.Context, key string, ttl time.Durat
 
 	return d.client.Expire(dflyCtx, key, ttl).Err()
 }
+
+// LSet overwrites one element of a LIST by index. The transcript list is append-only, so an
+// index read via LRange stays valid; corrections use this to amend a single entry in place.
+func (d *DragonflyClient) LSet(ctx context.Context, key string, index int64, value interface{}) error {
+	dflyCtx, cancel := context.WithTimeout(ctx, d.defaultTimeout)
+	defer cancel()
+
+	return d.client.LSet(dflyCtx, key, index, value).Err()
+}
+
+// GetDel atomically reads and deletes a key, returning "" when it doesn't exist. Used to consume
+// the summary_stale signal so a "rewrite" request can't be lost between a read and a delete.
+func (d *DragonflyClient) GetDel(ctx context.Context, key string) (string, error) {
+	dflyCtx, cancel := context.WithTimeout(ctx, d.defaultTimeout)
+	defer cancel()
+
+	value, err := d.client.GetDel(dflyCtx, key).Result()
+	if err == redis.Nil {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to getdel key %s: %w", key, err)
+	}
+	return value, nil
+}
