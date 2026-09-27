@@ -370,3 +370,68 @@ func (s *DispatchSuite) TestApplyTranscriptCorrection_ValidationAndGuardRelease(
 func redisZ(score int64, member string) redis.Z {
 	return redis.Z{Score: float64(score), Member: member}
 }
+
+func (s *DispatchSuite) TestOperatorCorrections_CreateEditRemove() {
+	tc := s.newClientUnderTest(new(mockSlackPoster), new(mockMLClient))
+	rec := &capturingRecorder{}
+	tc.recorder = rec
+	tgid, meta := s.seedActiveRescue(tc)
+	at := time.Date(2026, 9, 27, 14, 5, 12, 0, time.Local)
+
+	got, created, err := tc.UpsertOperatorCorrection(s.ctx, meta.ThreadTS, "ts-note", "U1", "diabetic per family", at)
+	s.Require().NoError(err)
+	s.Equal(tgid, got)
+	s.True(created)
+
+	_, created, err = tc.UpsertOperatorCorrection(s.ctx, meta.ThreadTS, "ts-note", "U1", "diabetic, insulin in pack", at)
+	s.Require().NoError(err)
+	s.False(created, "same slack ts = edit")
+
+	entries, err := tc.readEntries(s.ctx, tgid)
+	s.Require().NoError(err)
+	s.Len(entries, 2, "edit amends in place, no new entry")
+	in := buildSummaryInput(meta, entries, nil, "")
+	s.Equal([]ml.OperatorCorrection{{At: "14:05:12", Text: "diabetic, insulin in pack"}}, in.OperatorCorrections)
+
+	_, removed, err := tc.RemoveOperatorCorrection(s.ctx, meta.ThreadTS, "ts-note", "U1")
+	s.Require().NoError(err)
+	s.True(removed)
+	entries, _ = tc.readEntries(s.ctx, tgid)
+	s.Len(entries, 2, "retraction is a tombstone; indexes stay stable")
+	s.Empty(buildSummaryInput(meta, entries, nil, "").OperatorCorrections)
+
+	_, removed, err = tc.RemoveOperatorCorrection(s.ctx, meta.ThreadTS, "ts-never-stored", "U1")
+	s.Require().NoError(err)
+	s.False(removed)
+
+	s.Require().Len(rec.hc, 3)
+	s.Equal([]string{dataset.HumanCorrectionActionCreate, dataset.HumanCorrectionActionEdit, dataset.HumanCorrectionActionDelete},
+		[]string{rec.hc[0].Action, rec.hc[1].Action, rec.hc[2].Action})
+	s.Equal("diabetic per family", rec.hc[1].PriorText)
+}
+
+func (s *DispatchSuite) TestOperatorCorrections_NoActiveRescue() {
+	tc := s.newClientUnderTest(new(mockSlackPoster), new(mockMLClient))
+	_, _, err := tc.UpsertOperatorCorrection(s.ctx, "ts-nothing", "ts-note", "U1", "x", time.Now())
+	s.ErrorIs(err, ErrRescueNotActive)
+}
+
+func (s *DispatchSuite) TestMigrateOperatorCorrections_CopiesLiveNotesOnly() {
+	tc := s.newClientUnderTest(new(mockSlackPoster), new(mockMLClient))
+	oldTGID, meta := s.seedActiveRescue(tc)
+	_, _, err := tc.UpsertOperatorCorrection(s.ctx, meta.ThreadTS, "ts-a", "U1", "keep me", time.Now())
+	s.Require().NoError(err)
+	_, _, err = tc.UpsertOperatorCorrection(s.ctx, meta.ThreadTS, "ts-b", "U1", "retracted", time.Now())
+	s.Require().NoError(err)
+	_, _, err = tc.RemoveOperatorCorrection(s.ctx, meta.ThreadTS, "ts-b", "U1")
+	s.Require().NoError(err)
+
+	newTGID := talkgroupFromRadioShortCode["TAC8"].TGID
+	s.Require().NoError(tc.MigrateOperatorCorrections(s.ctx, oldTGID, newTGID))
+
+	entries, err := tc.readEntries(s.ctx, newTGID)
+	s.Require().NoError(err)
+	s.Require().Len(entries, 1, "radio entries and tombstones are not migrated")
+	s.Equal("keep me", entries[0].Text)
+	s.Equal("ts-a", entries[0].SlackTS, "slack ts preserved so later edits/deletes still resolve")
+}
