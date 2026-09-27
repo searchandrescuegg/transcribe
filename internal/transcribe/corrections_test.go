@@ -170,3 +170,26 @@ func (s *DispatchSuite) TestHandleAdditionalDispatch_PreservesConcurrentDispatch
 	s.Equal("fixed dispatch", got.Transcription)
 	s.NotNil(got.DispatchCorrection)
 }
+
+func (s *DispatchSuite) TestSweep_ClosedAlertKeepsDispatchCorrection() {
+	slackMock := new(mockSlackPoster)
+	tc := s.newClientUnderTest(slackMock, new(mockMLClient))
+	tgid := talkgroupFromRadioShortCode["TAC10"].TGID
+	meta := ClosureMeta{TGID: tgid, TACChannel: "TAC10", ThreadTS: "ts-rescue", SourceTalkgroup: FireDispatch1TGID,
+		MessageTS: "ts-rescue", Transcription: "fixed dispatch",
+		DispatchCorrection: &TranscriptCorrection{By: "U9", At: time.Now(), Original: "rescue tail"}}
+	s.scheduleClosureFixture(tgid, time.Now().Add(-time.Second).Unix(), meta)
+
+	slackMock.On("UpdateMessageContext", mock.Anything, "C-TEST", "ts-rescue", mock.Anything).Return("", "", "", nil).Once()
+	slackMock.On("SendMessageContext", mock.Anything, "C-TEST", mock.Anything).Return("", "ts-closed", "", nil).Once()
+
+	tc.sweepOnce(s.ctx)
+	slackMock.AssertExpectations(s.T())
+
+	// Builder-level assertion: closed-mode alert built from this meta carries the label.
+	closedAt := time.Now()
+	blocks := BuildRescueTrailBlocks(&RescueTrailBlocksInput{TACChannel: "TAC10", TranscriptionText: meta.Transcription,
+		DispatchTGID: FireDispatch1TGID, ClosedAt: &closedAt, Correction: meta.DispatchCorrection})
+	b, _ := json.Marshal(blocks)
+	s.Contains(string(b), "Corrected by")
+}

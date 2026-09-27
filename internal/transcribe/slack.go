@@ -45,6 +45,9 @@ type RescueTrailBlocksInput struct {
 	// the live interpretation detects SAR has been contacted. Latched by the caller, so once
 	// set it persists through the closed-mode rewrite too.
 	SARNotified bool
+	// Correction renders the ":pencil2: Corrected by" label under the transcription when a
+	// human corrected the dispatch text. Nil keeps the alert byte-identical to before.
+	Correction *TranscriptCorrection
 }
 
 // Action IDs are the routing keys the slackctl controller dispatches on. Keep these in
@@ -150,6 +153,12 @@ func BuildRescueTrailBlocks(rtbi *RescueTrailBlocksInput) []slack.Block {
 
 		// Rich text block with expiration / closure info
 		buildRescueStatusBlock(talkgroup.ShortName, rtbi.ExpiresAt, rtbi.ClosedAt),
+	}
+
+	// Correction label directly under the transcription (header, divider, channel, transcript
+	// = indexes 0-3). Inserted before the SAR badge shifts indexes.
+	if rtbi.Correction != nil {
+		blocks = append(blocks[:4:4], append([]slack.Block{buildCorrectionContextBlock(rtbi.Correction)}, blocks[4:]...)...)
 	}
 
 	// SAR-notified badge, inserted right after the header for at-a-glance visibility. Gated
@@ -361,6 +370,9 @@ type ThreadCommunicationBlocksInput struct {
 	Channel string
 	Message string
 	TS      time.Time
+	// Correction renders the ":pencil2: Corrected by" label after the transcript when a human
+	// corrected this transmission. Nil keeps the reply byte-identical to before.
+	Correction *TranscriptCorrection
 }
 
 func BuildThreadCommunicationBlocks(tcbi *ThreadCommunicationBlocksInput) []slack.Block {
@@ -391,6 +403,11 @@ func BuildThreadCommunicationBlocks(tcbi *ThreadCommunicationBlocksInput) []slac
 		slack.NewDividerBlock(),
 	}
 
+	if tcbi.Correction != nil {
+		// Label goes after the transcript, before the trailing divider.
+		last := len(blocks) - 1
+		blocks = append(blocks[:last:last], buildCorrectionContextBlock(tcbi.Correction), blocks[last])
+	}
 	return blocks
 }
 
@@ -520,4 +537,28 @@ func BuildChannelClosedBlocks(ccbi *ChannelClosedBlocksInput) []slack.Block {
 	}
 
 	return blocks
+}
+
+// maxCorrectionLabelOriginal bounds the struck-through "previously" text so the context block
+// stays well under Slack's 3000-char text limit and readable in the thread.
+const maxCorrectionLabelOriginal = 300
+
+// buildCorrectionContextBlock renders ":pencil2: Corrected by @user · 15:04 · previously: ~old~".
+// The original is collapsed to one line, truncated, mrkdwn-escaped, and stripped of tildes
+// (which would terminate the strikethrough).
+func buildCorrectionContextBlock(c *TranscriptCorrection) slack.Block {
+	text := fmt.Sprintf(":pencil2: Corrected by <@%s> · %s", c.By, c.At.Local().Format("15:04"))
+	if orig := labelSafe(c.Original); orig != "" {
+		text += " · previously: ~" + orig + "~"
+	}
+	return slack.NewContextBlock("", slack.NewTextBlockObject(slack.MarkdownType, text, false, false))
+}
+
+func labelSafe(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	s = strings.ReplaceAll(s, "~", "")
+	if r := []rune(s); len(r) > maxCorrectionLabelOriginal {
+		s = string(r[:maxCorrectionLabelOriginal]) + "…"
+	}
+	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(s)
 }

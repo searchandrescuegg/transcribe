@@ -212,6 +212,7 @@ func (tc *TranscribeClient) updateAlertForClosure(ctx context.Context, m *Closur
 		FeedbackURL:      feedbackURL,
 		// Preserve the SAR-notified badge on the closed alert if it was set during the rescue.
 		SARNotified: tc.summarySARNotified(ctx, m.TGID),
+		Correction:  m.DispatchCorrection,
 	})
 
 	updateCtx, cancel := context.WithTimeout(ctx, tc.config.SlackTimeout)

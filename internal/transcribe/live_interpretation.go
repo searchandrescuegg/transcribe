@@ -307,41 +307,10 @@ func (tc *TranscribeClient) publishLiveInterpretation(ctx context.Context, tacTG
 // through ClosureMeta. If the expiry can't be read (rescue already closing/closed), skip
 // rather than render a bogus timestamp.
 func (tc *TranscribeClient) badgeParentAlertSAR(ctx context.Context, tgid string, meta ClosureMeta) {
-	if meta.MessageTS == "" || meta.Transcription == "" {
-		return // no message to update, or can't rebuild the alert faithfully
+	if tc.rerenderParentAlert(ctx, meta, true, fmt.Sprintf("%s — Search & Rescue notified", meta.TACChannel)) {
+		slog.Info("live interpretation: badged parent alert — SAR notified",
+			slog.String("tgid", tgid), slog.String("tac", meta.TACChannel))
 	}
-
-	score, err := tc.dragonflyClient.ZScore(ctx, activeTACsKey, tgid)
-	if err != nil {
-		slog.Warn("live interpretation: SAR badge skipped; could not read expiry from active_tacs",
-			slog.String("error", err.Error()), slog.String("tgid", tgid))
-		return
-	}
-	expiresAt := time.Unix(int64(score), 0).Local()
-
-	blocks := BuildRescueTrailBlocks(&RescueTrailBlocksInput{
-		TACChannel:        meta.TACChannel,
-		TranscriptionText: meta.Transcription,
-		ExpiresAt:         expiresAt,
-		DispatchTGID:      FireDispatch1TGID,
-		TACTalkgroupTGID:  meta.TGID, // keeps the Cancel/Close/Extend/Switch actions on the live alert
-		SARNotified:       true,
-	})
-
-	updateCtx, cancel := context.WithTimeout(ctx, tc.config.SlackTimeout)
-	defer cancel()
-	if _, _, _, err := tc.slackClient.UpdateMessageContext(updateCtx,
-		tc.config.SlackChannelID,
-		meta.MessageTS,
-		slack.MsgOptionBlocks(blocks...),
-		slack.MsgOptionText(fmt.Sprintf("%s — Search & Rescue notified", meta.TACChannel), false),
-	); err != nil {
-		slog.Warn("live interpretation: failed to badge parent alert with SAR-notified",
-			slog.String("error", err.Error()), slog.String("tgid", tgid), slog.String("message_ts", meta.MessageTS))
-		return
-	}
-	slog.Info("live interpretation: badged parent alert — SAR notified",
-		slog.String("tgid", tgid), slog.String("tac", meta.TACChannel))
 }
 
 // sendSlackInThread is a convenience wrapper that goes through sendSlackWithRetry and also
