@@ -104,6 +104,8 @@ func New(cfg *config.Config, dfly *dragonfly.DragonflyClient, corrections Correc
 func (c *Controller) Run(ctx context.Context) error {
 	handler := socketmode.NewSocketmodeHandler(c.smClient)
 	handler.Handle(socketmode.EventTypeInteractive, c.dispatch)
+	// Events API: `message` events carry `correction:` thread replies (see operator_corrections.go).
+	handler.Handle(socketmode.EventTypeEventsAPI, c.dispatchEvent)
 	slog.Info("slackctl: starting Socket Mode controller", slog.Int("authorized_users", len(c.allowed)))
 	if err := handler.RunEventLoopContext(ctx); err != nil {
 		return fmt.Errorf("socketmode event loop: %w", err)
