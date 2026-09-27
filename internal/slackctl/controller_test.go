@@ -278,10 +278,41 @@ func (s *SlackctlSuite) TestSwitchTAC_UnknownNewTGID_Errors() {
 	s.Require().Error(err)
 }
 
+// upsertCall / removeCall / refreshCall record each fakeCorrections invocation so tests can
+// assert both the arguments a caller passed in AND (for refresh) what the controller decided
+// to do with the configured return values.
+type upsertCall struct {
+	threadTS, slackTS, userID, text string
+	at                              time.Time
+}
+
+type removeCall struct {
+	threadTS, slackTS, userID string
+}
+
+type refreshCall struct {
+	tgid    string
+	rewrite bool
+}
+
 type fakeCorrections struct {
 	mu       sync.Mutex
 	migrated [][2]string
 	migErr   error
+
+	// Configurable return values for UpsertOperatorCorrection / RemoveOperatorCorrection —
+	// set before exercising the controller, read (and calls recorded) under mu.
+	upsertTGID    string
+	upsertCreated bool
+	upsertErr     error
+	upsertCalls   []upsertCall
+
+	removeTGID    string
+	removeRemoved bool
+	removeErr     error
+	removeCalls   []removeCall
+
+	refreshCalls []refreshCall
 }
 
 func (f *fakeCorrections) ResolveCorrectionTarget(context.Context, string, string) (transcribe.CorrectionTarget, error) {
@@ -290,11 +321,17 @@ func (f *fakeCorrections) ResolveCorrectionTarget(context.Context, string, strin
 func (f *fakeCorrections) ApplyTranscriptCorrection(context.Context, transcribe.CorrectionTarget, string, string, time.Time) error {
 	return nil
 }
-func (f *fakeCorrections) UpsertOperatorCorrection(context.Context, string, string, string, string, time.Time) (string, bool, error) {
-	return "", false, nil
+func (f *fakeCorrections) UpsertOperatorCorrection(_ context.Context, threadTS, slackTS, userID, text string, at time.Time) (string, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.upsertCalls = append(f.upsertCalls, upsertCall{threadTS, slackTS, userID, text, at})
+	return f.upsertTGID, f.upsertCreated, f.upsertErr
 }
-func (f *fakeCorrections) RemoveOperatorCorrection(context.Context, string, string, string) (string, bool, error) {
-	return "", false, nil
+func (f *fakeCorrections) RemoveOperatorCorrection(_ context.Context, threadTS, slackTS, userID string) (string, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.removeCalls = append(f.removeCalls, removeCall{threadTS, slackTS, userID})
+	return f.removeTGID, f.removeRemoved, f.removeErr
 }
 func (f *fakeCorrections) MigrateOperatorCorrections(_ context.Context, oldTGID, newTGID string) error {
 	f.mu.Lock()
@@ -302,7 +339,23 @@ func (f *fakeCorrections) MigrateOperatorCorrections(_ context.Context, oldTGID,
 	f.migrated = append(f.migrated, [2]string{oldTGID, newTGID})
 	return f.migErr
 }
-func (f *fakeCorrections) RefreshLiveInterpretation(context.Context, string, bool) {}
+func (f *fakeCorrections) RefreshLiveInterpretation(_ context.Context, tgid string, rewrite bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.refreshCalls = append(f.refreshCalls, refreshCall{tgid, rewrite})
+}
+
+func (f *fakeCorrections) upsertCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.upsertCalls)
+}
+
+func (f *fakeCorrections) snapshot() (upserts []upsertCall, removes []removeCall, refreshes []refreshCall) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]upsertCall(nil), f.upsertCalls...), append([]removeCall(nil), f.removeCalls...), append([]refreshCall(nil), f.refreshCalls...)
+}
 
 func (s *SlackctlSuite) TestSwitchTAC_CarriesDispatchCorrectionAndMigratesNotes() {
 	s.preloadActiveTAC("1389", "TAC1", "ts-rescue-1")
