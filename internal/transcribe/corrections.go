@@ -17,7 +17,9 @@ import (
 // dispatch-correction label, SAR badge, status line, action buttons — and chat.updates it.
 // Shared by the SAR-badge transition and dispatch corrections so neither drops the other's
 // decoration. The current expiry comes from active_tacs; if it can't be read the rescue is
-// closing, so skip. Best-effort: returns false on any failure.
+// closing, so skip. Best-effort: returns false on any failure. Goes through
+// updateMessageWithRetry (shared with the TAC-correction relabel) so a rate-limited Slack
+// call gets the same single bounded retry as every other relabel path.
 func (tc *TranscribeClient) rerenderParentAlert(ctx context.Context, meta ClosureMeta, sarNotified bool, fallback string) bool {
 	if meta.MessageTS == "" || meta.Transcription == "" {
 		return false
@@ -37,9 +39,7 @@ func (tc *TranscribeClient) rerenderParentAlert(ctx context.Context, meta Closur
 		SARNotified:       sarNotified,
 		Correction:        meta.DispatchCorrection,
 	})
-	updateCtx, cancel := context.WithTimeout(ctx, tc.config.SlackTimeout)
-	defer cancel()
-	if _, _, _, err := tc.slackClient.UpdateMessageContext(updateCtx, tc.config.SlackChannelID, meta.MessageTS,
+	if err := tc.updateMessageWithRetry(ctx, meta.MessageTS,
 		slack.MsgOptionBlocks(blocks...), slack.MsgOptionText(fallback, false)); err != nil {
 		slog.Warn("parent alert re-render failed",
 			slog.String("error", err.Error()), slog.String("tgid", meta.TGID), slog.String("message_ts", meta.MessageTS))
@@ -219,7 +219,9 @@ func (tc *TranscribeClient) applyTACCorrection(ctx context.Context, target Corre
 	blocks := BuildThreadCommunicationBlocks(&ThreadCommunicationBlocksInput{
 		Channel: channelName, Message: text, TS: postedAt.Local(), Correction: &corr,
 	})
-	tc.updateMessageWithRetry(ctx, target.MessageTS, slack.MsgOptionBlocks(blocks...), slack.MsgOptionText(text, false))
+	if err := tc.updateMessageWithRetry(ctx, target.MessageTS, slack.MsgOptionBlocks(blocks...), slack.MsgOptionText(text, false)); err != nil {
+		slog.Warn("corrections: failed to relabel corrected post", slog.String("error", err.Error()), slog.String("message_ts", target.MessageTS))
+	}
 
 	return dataset.HumanCorrectionRecord{Kind: dataset.HumanCorrectionKindTAC, S3Key: e.S3Key, PriorText: e.Text}, nil
 }
@@ -238,16 +240,27 @@ func (tc *TranscribeClient) applyDispatchCorrection(ctx context.Context, target 
 	if err != nil {
 		return dataset.HumanCorrectionRecord{}, fmt.Errorf("marshal closure meta: %w", err)
 	}
-	if err := tc.dragonflyClient.Set(ctx, fmt.Sprintf(tacMetaKeyFmt, meta.TGID), closureMetaTTL, string(payload)); err != nil {
+	// SetXX (not Set): tac_meta may have been deleted between our read and this write (a
+	// sweeper close, Cancel, or Switch racing this correction). A plain Set would resurrect
+	// the key with a fresh 24h TTL and none of active_tacs / allowed_talkgroups / tg:<TGID>
+	// behind it, silently reviving a dead rescue for a full day. If it's gone, the rescue is
+	// no longer active — surface that instead of writing a zombie key.
+	set, err := tc.dragonflyClient.SetXX(ctx, fmt.Sprintf(tacMetaKeyFmt, meta.TGID), string(payload))
+	if err != nil {
 		return dataset.HumanCorrectionRecord{}, fmt.Errorf("write closure meta: %w", err)
+	}
+	if !set {
+		return dataset.HumanCorrectionRecord{}, ErrRescueNotActive
 	}
 	tc.rerenderParentAlert(ctx, meta, tc.summarySARNotified(ctx, meta.TGID), fmt.Sprintf("%s — dispatch transcript corrected", meta.TACChannel))
 	return dataset.HumanCorrectionRecord{Kind: dataset.HumanCorrectionKindDispatch, S3Key: meta.DispatchS3Key, PriorText: corr.Original}, nil
 }
 
-// updateMessageWithRetry chat.updates a post, retrying once on a retryable rate limit.
-// Best-effort: the stored correction is authoritative; the label is presentation.
-func (tc *TranscribeClient) updateMessageWithRetry(ctx context.Context, ts string, opts ...slack.MsgOption) {
+// updateMessageWithRetry chat.updates a post, retrying once on a retryable rate limit. Each
+// attempt is bounded by SlackTimeout. Shared by both relabel paths (TAC entry, dispatch
+// parent alert) so neither drops the retry the other has. Best-effort: the stored correction
+// is authoritative; the label is presentation — callers log the returned error and move on.
+func (tc *TranscribeClient) updateMessageWithRetry(ctx context.Context, ts string, opts ...slack.MsgOption) error {
 	update := func() error {
 		uctx, cancel := context.WithTimeout(ctx, tc.config.SlackTimeout)
 		defer cancel()
@@ -259,14 +272,12 @@ func (tc *TranscribeClient) updateMessageWithRetry(ctx context.Context, ts strin
 	if errors.As(err, &rate) && rate.Retryable() {
 		select {
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		case <-time.After(rate.RetryAfter):
 		}
 		err = update()
 	}
-	if err != nil {
-		slog.Warn("corrections: failed to relabel corrected post", slog.String("error", err.Error()), slog.String("message_ts", ts))
-	}
+	return err
 }
 
 func (tc *TranscribeClient) recordHumanCorrection(rec dataset.HumanCorrectionRecord) {

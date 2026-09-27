@@ -327,6 +327,29 @@ func (s *DispatchSuite) TestApplyTranscriptCorrection_Dispatch_UpdatesMetaAndAle
 	s.Equal(meta.Transcription, got.DispatchCorrection.Original)
 }
 
+// tac_meta can be deleted between ResolveCorrectionTarget and ApplyTranscriptCorrection by a
+// sweeper close, a Cancel, or a Switch racing the correction. SetXX must refuse to resurrect
+// it (rather than writing a zombie key with none of active_tacs / allowed_talkgroups /
+// tg:<TGID> behind it), and the one-shot guard must be released so the request isn't bricked.
+func (s *DispatchSuite) TestApplyTranscriptCorrection_Dispatch_TacMetaDeletedConcurrently_ReturnsErrRescueNotActive() {
+	tc := s.newClientUnderTest(new(mockSlackPoster), new(mockMLClient))
+	tgid, meta := s.seedActiveRescue(tc)
+	target, err := tc.ResolveCorrectionTarget(s.ctx, meta.MessageTS, meta.ThreadTS)
+	s.Require().NoError(err)
+
+	s.Require().NoError(s.rdb.Del(s.ctx, fmt.Sprintf(tacMetaKeyFmt, tgid)).Err())
+
+	s.ErrorIs(tc.ApplyTranscriptCorrection(s.ctx, target, "U1", "new text", time.Now()), ErrRescueNotActive)
+
+	exists, err := s.rdb.Exists(s.ctx, fmt.Sprintf(tacMetaKeyFmt, tgid)).Result()
+	s.Require().NoError(err)
+	s.EqualValues(0, exists, "SetXX must not resurrect a deleted tac_meta key")
+
+	exists, err = s.rdb.Exists(s.ctx, fmt.Sprintf(correctedGuardKeyFmt, meta.MessageTS)).Result()
+	s.Require().NoError(err)
+	s.EqualValues(0, exists, "guard must be released so a retry isn't bricked")
+}
+
 func (s *DispatchSuite) TestApplyTranscriptCorrection_ValidationAndGuardRelease() {
 	tc := s.newClientUnderTest(new(mockSlackPoster), new(mockMLClient))
 	_, meta := s.seedActiveRescue(tc)

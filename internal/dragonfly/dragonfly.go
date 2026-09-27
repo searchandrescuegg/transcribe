@@ -161,6 +161,19 @@ func (d *DragonflyClient) LSet(ctx context.Context, key string, index int64, val
 	return d.client.LSet(dflyCtx, key, index, value).Err()
 }
 
+// SetXX writes value to key only if the key already exists, and keeps whatever TTL is
+// currently set on it (go-redis's KeepTTL sentinel). Used by dispatch corrections: a plain
+// Set would resurrect tac_meta:<TGID> with a fresh 24h TTL even after a sweeper close /
+// Cancel / Switch deleted it (and, with it, active_tacs / allowed_talkgroups / tg:<TGID>),
+// silently reviving a dead rescue with none of its routing behind it. Returns whether the
+// write happened.
+func (d *DragonflyClient) SetXX(ctx context.Context, key string, value interface{}) (bool, error) {
+	dflyCtx, cancel := context.WithTimeout(ctx, d.defaultTimeout)
+	defer cancel()
+
+	return d.client.SetXX(dflyCtx, key, value, redis.KeepTTL).Result()
+}
+
 // GetDel atomically reads and deletes a key, returning "" when it doesn't exist. Used to consume
 // the summary_stale signal so a "rewrite" request can't be lost between a read and a delete.
 func (d *DragonflyClient) GetDel(ctx context.Context, key string) (string, error) {
