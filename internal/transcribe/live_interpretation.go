@@ -50,10 +50,12 @@ const (
 	// We tie this to OPENAI_TIMEOUT-equivalent semantics: the holder either finishes within
 	// this window or its lock expires and another worker can pick up.
 	summaryLockTTL = 150 * time.Second
-	// summaryStaleTTL is short on purpose: the flag is meaningful only for the brief window
-	// between RPush-during-lock and the lock holder's next stale-check. Beyond that the
-	// next transmission will retrigger the path naturally.
-	summaryStaleTTL = 60 * time.Second
+	// summaryStaleTTL must outlive the longest summary pass. The flag is set by a lock loser
+	// while the holder's pass is in flight and read only after that pass finishes; if it
+	// expired sooner (a summary LLM call can take up to ~120s), a pending "rewrite" — or a
+	// plain rerun — would silently vanish before the holder consumed it. Tying it to the lock
+	// TTL guarantees the flag survives any pass the lock itself can cover.
+	summaryStaleTTL = summaryLockTTL
 
 	// summary_stale values. "1" = a transmission arrived during the last pass, rerun additively.
 	// "rewrite" = an edit/retraction arrived, rerun WITHOUT the previous summary. A pending
