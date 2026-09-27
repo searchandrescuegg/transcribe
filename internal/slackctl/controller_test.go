@@ -3,7 +3,9 @@ package slackctl
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -91,6 +93,7 @@ func (s *SlackctlSuite) SetupTest() {
 		dfly: dfly,
 		cfg: &config.Config{
 			TacticalChannelActivationDuration: 30 * time.Minute,
+			WorkerTimeout:                     5 * time.Second,
 		},
 	}
 }
@@ -273,6 +276,69 @@ func (s *SlackctlSuite) TestSwitchTAC_UnknownNewTGID_Errors() {
 	s.preloadActiveTAC("1389", "TAC1", "ts-rescue-1")
 	_, _, _, err := s.controller.SwitchTAC(s.ctx, "1389", "9999")
 	s.Require().Error(err)
+}
+
+type fakeCorrections struct {
+	mu       sync.Mutex
+	migrated [][2]string
+	migErr   error
+}
+
+func (f *fakeCorrections) ResolveCorrectionTarget(context.Context, string, string) (transcribe.CorrectionTarget, error) {
+	return transcribe.CorrectionTarget{}, nil
+}
+func (f *fakeCorrections) ApplyTranscriptCorrection(context.Context, transcribe.CorrectionTarget, string, string, time.Time) error {
+	return nil
+}
+func (f *fakeCorrections) UpsertOperatorCorrection(context.Context, string, string, string, string, time.Time) (string, bool, error) {
+	return "", false, nil
+}
+func (f *fakeCorrections) RemoveOperatorCorrection(context.Context, string, string, string) (string, bool, error) {
+	return "", false, nil
+}
+func (f *fakeCorrections) MigrateOperatorCorrections(_ context.Context, oldTGID, newTGID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.migrated = append(f.migrated, [2]string{oldTGID, newTGID})
+	return f.migErr
+}
+func (f *fakeCorrections) RefreshLiveInterpretation(context.Context, string, bool) {}
+
+func (s *SlackctlSuite) TestSwitchTAC_CarriesDispatchCorrectionAndMigratesNotes() {
+	s.preloadActiveTAC("1389", "TAC1", "ts-rescue-1")
+	// Give the old meta a transcription + correction.
+	raw, err := s.rdb.Get(s.ctx, fmt.Sprintf(tacMetaKeyFmt, "1389")).Result()
+	s.Require().NoError(err)
+	var meta transcribe.ClosureMeta
+	s.Require().NoError(json.Unmarshal([]byte(raw), &meta))
+	meta.Transcription = "fixed dispatch"
+	meta.DispatchS3Key = "obj.wav"
+	meta.DispatchCorrection = &transcribe.TranscriptCorrection{By: "U1", At: time.Now().UTC().Truncate(time.Second), Original: "orig"}
+	payload, _ := json.Marshal(meta)
+	s.Require().NoError(s.rdb.Set(s.ctx, fmt.Sprintf(tacMetaKeyFmt, "1389"), string(payload), time.Hour).Err())
+
+	fake := &fakeCorrections{migErr: errors.New("boom")} // a migration failure must not fail the switch
+	s.controller.corrections = fake
+
+	newMeta, _, ok, err := s.controller.SwitchTAC(s.ctx, "1389", "1963")
+	s.Require().NoError(err)
+	s.True(ok)
+	s.Equal("fixed dispatch", newMeta.Transcription)
+	s.Equal("obj.wav", newMeta.DispatchS3Key)
+	s.Require().NotNil(newMeta.DispatchCorrection)
+	s.Equal("U1", newMeta.DispatchCorrection.By)
+	s.Equal([][2]string{{"1389", "1963"}}, fake.migrated)
+}
+
+func TestCorrectionErrorMessage(t *testing.T) {
+	at := time.Date(2026, 9, 27, 15, 4, 0, 0, time.Local)
+	assert.Contains(t, correctionErrorMessage(&transcribe.AlreadyCorrectedError{
+		Correction: transcribe.TranscriptCorrection{By: "U9", At: at}}), "<@U9> at 15:04")
+	assert.Contains(t, correctionErrorMessage(transcribe.ErrRescueNotActive), "closed")
+	assert.Contains(t, correctionErrorMessage(transcribe.ErrNotCorrectable), "Only dispatch and radio")
+	assert.Contains(t, correctionErrorMessage(transcribe.ErrEmptyCorrection), "empty")
+	assert.Contains(t, correctionErrorMessage(transcribe.ErrUnchangedCorrection), "unchanged")
+	assert.Contains(t, correctionErrorMessage(errors.New("x")), "check service logs")
 }
 
 func TestParseOldTGIDFromBlockID(t *testing.T) {

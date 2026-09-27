@@ -39,11 +39,15 @@ type Controller struct {
 	// leadership gate entirely — operators choosing this should know what they're trading
 	// off (lost audit-trail-as-authz, fat-finger surface area).
 	allowAny bool
+
+	// corrections drives human transcript corrections and `correction:` notes. Nil disables
+	// them (tests that only exercise cancel/extend/switch construct the controller without it).
+	corrections CorrectionService
 }
 
 // New constructs the controller. Returns ErrSocketModeDisabled if SLACK_APP_TOKEN is
 // empty so callers can no-op gracefully when the feature isn't configured.
-func New(cfg *config.Config, dfly *dragonfly.DragonflyClient) (*Controller, error) {
+func New(cfg *config.Config, dfly *dragonfly.DragonflyClient, corrections CorrectionService) (*Controller, error) {
 	if cfg.SlackAppToken == "" {
 		return nil, ErrSocketModeDisabled
 	}
@@ -91,6 +95,7 @@ func New(cfg *config.Config, dfly *dragonfly.DragonflyClient) (*Controller, erro
 		cfg:         cfg,
 		allowed:     allowed,
 		allowAny:    allowAny,
+		corrections: corrections,
 	}, nil
 }
 
