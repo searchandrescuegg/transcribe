@@ -127,3 +127,46 @@ func (s *DispatchSuite) TestRefresh_HolderHonorsPendingRewrite() {
 	tc.RefreshLiveInterpretation(s.ctx, tgid, false)
 	mlMock.AssertExpectations(s.T())
 }
+
+func (s *DispatchSuite) TestProcessNonDispatchCall_RecordsPostTSAndS3Key() {
+	slackMock, mlMock := new(mockSlackPoster), new(mockMLClient)
+	tc := s.newClientUnderTest(slackMock, mlMock)
+	tgid := talkgroupFromRadioShortCode["TAC10"].TGID
+	s.Require().NoError(tc.dragonflyClient.Set(s.ctx, fmt.Sprintf(talkgroupKeyPrefix, tgid), time.Hour, "ts-rescue"))
+	// No tac_meta → the summary pass no-ops; we only care about the stored entry.
+	slackMock.On("SendMessageContext", mock.Anything, "C-TEST", mock.Anything).Return("C-TEST", "ts-post-1", "", nil).Once()
+
+	parsed := &AdornedDeconstructedKey{dk: &DeconstructedKey{Talkgroup: tgid, Time: time.Now()}, key: "2026/09/27/14/1967/obj.wav"}
+	s.Require().NoError(tc.processNonDispatchCall(s.ctx, parsed, stubASRResponse("on scene")))
+
+	idx, e, found, err := tc.findEntryBySlackTS(s.ctx, tgid, "ts-post-1", entryKindRadio)
+	s.Require().NoError(err)
+	s.Require().True(found)
+	s.EqualValues(0, idx)
+	s.Equal("2026/09/27/14/1967/obj.wav", e.S3Key)
+	_, perr := time.Parse(time.RFC3339, e.PostedAt)
+	s.NoError(perr, "posted_at must be RFC3339 so the post can be re-rendered")
+}
+
+// A re-page must not clobber a dispatch correction written between its read and its write.
+func (s *DispatchSuite) TestHandleAdditionalDispatch_PreservesConcurrentDispatchCorrection() {
+	slackMock := new(mockSlackPoster)
+	tc := s.newClientUnderTest(slackMock, new(mockMLClient))
+	tgid := talkgroupFromRadioShortCode["TAC10"].TGID
+	stale := s.seedMeta(tc, tgid)
+
+	corrected := stale
+	corrected.Transcription = "fixed dispatch"
+	corrected.DispatchCorrection = &TranscriptCorrection{By: "U1", At: time.Now(), Original: stale.Transcription}
+	payload, _ := json.Marshal(corrected)
+	s.Require().NoError(s.rdb.Set(s.ctx, fmt.Sprintf(tacMetaKeyFmt, tgid), string(payload), time.Hour).Err())
+
+	slackMock.On("SendMessageContext", mock.Anything, "C-TEST", mock.Anything).Return("C-TEST", "ts-x", "", nil)
+	parsed := &AdornedDeconstructedKey{dk: &DeconstructedKey{Talkgroup: FireDispatch1TGID, Time: time.Now()}}
+	s.Require().NoError(tc.handleAdditionalDispatch(s.ctx, parsed, stubASRResponse("repage"), stale)) // stale copy passed in
+
+	got, ok := tc.readClosureMeta(s.ctx, tgid)
+	s.Require().True(ok)
+	s.Equal("fixed dispatch", got.Transcription)
+	s.NotNil(got.DispatchCorrection)
+}

@@ -161,6 +161,7 @@ func (tc *TranscribeClient) processDispatchCall(ctx context.Context, parsedKey *
 		SourceTalkgroup: parsedKey.dk.Talkgroup,
 		MessageTS:       tsThread, // alert is the thread parent; ts == thread_ts for chat.update later
 		Transcription:   tr.Transcription,
+		DispatchS3Key:   parsedKey.key,
 	}, expiresAt); err != nil {
 		slog.Error("failed to persist TAC closure schedule", slog.String("error", err.Error()), slog.String("tac_channel", dispatchMessage.TACChannel))
 	}
@@ -198,6 +199,11 @@ func (tc *TranscribeClient) handleAdditionalDispatch(ctx context.Context, parsed
 	}
 	// Reuse the ORIGINAL meta (thread_ts, message_ts, dispatch transcript) with the new expiry so
 	// the auto-close pushes out and the feedback prefill still reflects the initiating dispatch.
+	// Re-read right before writing: a dispatch correction may have landed since the caller read
+	// meta, and ScheduleTACClosure rewrites the whole JSON. Narrows (does not eliminate) the race.
+	if fresh, ok := tc.readClosureMeta(ctx, meta.TGID); ok {
+		meta = fresh
+	}
 	if err := tc.ScheduleTACClosure(ctx, meta, expiresAt); err != nil {
 		slog.Error("additional dispatch: failed to reschedule closure", slog.String("error", err.Error()), slog.String("tgid", meta.TGID))
 	}
@@ -240,28 +246,34 @@ func (tc *TranscribeClient) processNonDispatchCall(ctx context.Context, parsedKe
 	// back to the raw transcription so the transmission is never dropped.
 	cleaned := tc.maybeCleanTranscript(ctx, parsedKey.dk.Talkgroup, tr.Transcription)
 
-	// FIX (review item #1): sendSlackWithRetry actually retries on rate limit; the prior path
-	// waited and discarded the message. Errors now propagate so Work() can Nack for redelivery.
-	if _, err := tc.sendSlackWithRetry(ctx, parsedKey.dk.Talkgroup,
+	// postedAt is rendered on the post and stored so a later human correction can re-render the
+	// identical block with the corrected text.
+	postedAt := time.Now().Local()
+	postTS, err := tc.sendSlackWithRetry(ctx, parsedKey.dk.Talkgroup,
 		slack.MsgOptionBlocks(BuildThreadCommunicationBlocks(&ThreadCommunicationBlocksInput{
 			Channel: tgInfo.FullName,
 			Message: cleaned,
-			TS:      time.Now().Local(),
+			TS:      postedAt,
 		})...),
 		slack.MsgOptionAsUser(true),
 		slack.MsgOptionTS(tsThread),
-	); err != nil {
+	)
+	if err != nil {
 		return fmt.Errorf("%w: %s", ErrFailedToPostSlackMessage, err.Error())
 	}
 
 	slog.Debug("posted transcription message to Slack", slog.String("talkgroup", parsedKey.dk.Talkgroup), slog.String("thread_id", tsThread))
 
-	// Roll the rescue's live interpretation forward with the CLEANED text. Best-effort and
-	// decoupled — if the LLM call or chat.update fails we still consider the TAC transmission
-	// processed (the per-message thread reply above is the canonical record). Uses
-	// parsedKey.dk.Time as the capture moment so the model sees stable timestamps even when
-	// pipeline latency varies between transmissions.
-	tc.updateLiveInterpretation(ctx, parsedKey.dk.Talkgroup, parsedKey.dk.Time, cleaned)
+	// Roll the live interpretation forward with the CLEANED text, remembering the post ts and S3
+	// key so the "Correct transcript" shortcut can find and amend this exact entry later.
+	tc.appendAndRefresh(ctx, parsedKey.dk.Talkgroup, liveTranscriptEntry{
+		CapturedAt: parsedKey.dk.Time.Format("15:04:05"),
+		Text:       cleaned,
+		Kind:       entryKindRadio,
+		PostedAt:   postedAt.Format(time.RFC3339),
+		SlackTS:    postTS,
+		S3Key:      parsedKey.key,
+	})
 	return nil
 }
 
