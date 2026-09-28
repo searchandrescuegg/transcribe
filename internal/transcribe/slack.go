@@ -48,6 +48,9 @@ type RescueTrailBlocksInput struct {
 	// Correction renders the ":pencil2: Corrected by" label under the transcription when a
 	// human corrected the dispatch text. Nil keeps the alert byte-identical to before.
 	Correction *TranscriptCorrection
+	// Brief is the page-out-style line (FormatBrief output) rendered bold directly under the
+	// header. Empty keeps the alert byte-identical to the pre-brief layout.
+	Brief string
 }
 
 // Action IDs are the routing keys the slackctl controller dispatches on. Keep these in
@@ -167,6 +170,12 @@ func BuildRescueTrailBlocks(rtbi *RescueTrailBlocksInput) []slack.Block {
 	// allocate rather than alias the freshly-built literal.
 	if rtbi.SARNotified {
 		blocks = append(blocks[:1:1], append([]slack.Block{buildSARNotifiedBlock()}, blocks[1:]...)...)
+	}
+
+	// Brief block, inserted at index 1 (so SAR badge shifts to index 2). Gated so empty
+	// brief keeps the alert byte-identical.
+	if rtbi.Brief != "" {
+		blocks = append(blocks[:1:1], append([]slack.Block{buildBriefBlock(rtbi.Brief)}, blocks[1:]...)...)
 	}
 
 	// Action buttons only render while the rescue is live. Once ClosedAt is set the alert
@@ -561,4 +570,34 @@ func labelSafe(s string) string {
 		s = string(r[:maxCorrectionLabelOriginal]) + "…"
 	}
 	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(s)
+}
+
+// maxBriefSlotRunes bounds each brief slot so a verbose model can't turn the one-line brief
+// into a paragraph.
+const maxBriefSlotRunes = 40
+
+// FormatBrief renders the summary's page-out slots as "location · subject · condition",
+// dropping empty slots. Each slot is whitespace-collapsed, truncated, stripped of the bold
+// delimiters (* and _) that would break the wrapper, and mrkdwn-escaped. "" when nothing is set.
+func FormatBrief(s *ml.RescueSummary) string {
+	if s == nil {
+		return ""
+	}
+	var parts []string
+	for _, slot := range []string{s.BriefLocation, s.BriefSubject, s.BriefCondition} {
+		slot = strings.Join(strings.Fields(slot), " ")
+		slot = strings.NewReplacer("*", "", "_", "").Replace(slot)
+		if slot == "" {
+			continue
+		}
+		if r := []rune(slot); len(r) > maxBriefSlotRunes {
+			slot = string(r[:maxBriefSlotRunes]) + "…"
+		}
+		parts = append(parts, strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(slot))
+	}
+	return strings.Join(parts, " · ")
+}
+
+func buildBriefBlock(brief string) slack.Block {
+	return slack.NewSectionBlock(slack.NewTextBlockObject(slack.MarkdownType, "*"+brief+"*", false, false), nil, nil)
 }
