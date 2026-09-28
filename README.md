@@ -246,6 +246,19 @@ public URL, no signing-secret verification.
 Leaving `SLACK_APP_TOKEN` empty disables the buttons entirely — alerts ship without the
 actions row.
 
+6. **Human corrections** (allowlisted users only):
+   - **Correct transcript** — ⋯ menu → *Correct transcript* on the dispatch alert or any radio
+     transmission post. One correction per message; the post is relabelled
+     "✏️ Corrected by @you". The live interpretation is regenerated from the corrected text.
+   - **`correction:` replies** — a thread reply starting with `correction:` is treated as 100%
+     correct context by the live interpretation (✅ = applied). Editing or deleting the reply
+     updates/retracts it. Replies without the prefix are ignored.
+   Updating an existing app to this manifest adds scopes — reinstall and compare the Bot User
+   OAuth Token with `SLACK_TOKEN`, updating it if Slack issued a new one. This feature also
+   requires the bot to be a **member of the alert channel** (`/invite @transcribe`) — it needs
+   `message` events from that channel to see `correction:` replies, and `chat:write.public`
+   alone does not deliver those events.
+
 #### Live interpretation
 
 Every transmission appends to `tac_transcripts:<TGID>` and triggers a structured

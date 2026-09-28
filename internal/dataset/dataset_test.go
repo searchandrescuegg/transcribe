@@ -38,10 +38,10 @@ type fakeRecorder struct {
 	hc  []HumanCorrectionRecord
 }
 
-func (r *fakeRecorder) RecordTranscription(TranscriptionRecord)     {}
-func (r *fakeRecorder) RecordLLMInteraction(l LLMInteractionRecord) { r.llm = append(r.llm, l) }
+func (r *fakeRecorder) RecordTranscription(TranscriptionRecord)       {}
+func (r *fakeRecorder) RecordLLMInteraction(l LLMInteractionRecord)   { r.llm = append(r.llm, l) }
 func (r *fakeRecorder) RecordHumanCorrection(h HumanCorrectionRecord) { r.hc = append(r.hc, h) }
-func (r *fakeRecorder) Close() error                                { return nil }
+func (r *fakeRecorder) Close() error                                  { return nil }
 
 func TestRecordingMLClient_DispatchSuccess_RecordsAndPassesThrough(t *testing.T) {
 	inner := &fakeInner{dispatchOut: &ml.DispatchMessages{Transcription: "cleaned"}}

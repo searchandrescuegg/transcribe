@@ -139,6 +139,12 @@ prefill, and the sweeper's closed-alert rebuild inherit it without changes.
 
 ## Flows
 
+Note on sequencing (applies to all three flows below): the `TranscribeClient` service methods
+(`ApplyTranscriptCorrection`, `UpsertOperatorCorrection`, `RemoveOperatorCorrection`) only store
+the correction and relabel/react — they do not call the summarizer themselves. The controller
+calls `RefreshLiveInterpretation` (rewrite per the rules below) as a separate step after the
+service call returns, so the ✅ reaction (or the relabelled post) isn't delayed by the LLM call.
+
 ### Transcript correction (TAC)
 
 1. Validate synchronously: non-empty, differs from current effective text → else modal error.
@@ -234,8 +240,7 @@ CREATE TABLE IF NOT EXISTS human_corrections (
     s3_key         TEXT,
     slack_ts       TEXT NOT NULL,
     slack_user_id  TEXT NOT NULL,
-    asr_text       TEXT,
-    cleaned_text   TEXT,
+    prior_text     TEXT,
     corrected_text TEXT,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -244,6 +249,13 @@ CREATE TABLE IF NOT EXISTS human_corrections (
 Indexes on `s3_key`, `tgid`. `Recorder` gains `RecordHumanCorrection` via the same async
 drop-on-full writer; nil-safe when the dataset is disabled. Summary calls already log full input
 to `llm_interactions`, so corrections appear there automatically.
+
+`prior_text` replaces the originally-planned `asr_text`/`cleaned_text` pair: what the post showed
+immediately before this correction (the cleaned transcription, or the previous correction's text
+on a second edit) — one column, since `human_corrections` records the human's edit, not a second
+copy of the ASR pipeline's stages. Raw ASR is not stored in the transcript list (existing
+invariant: the list holds cleaned text only); join `human_corrections.s3_key` to
+`transcriptions.s3_key` for it.
 
 ## Testing
 

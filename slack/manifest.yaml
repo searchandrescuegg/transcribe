@@ -21,6 +21,9 @@
 #   8. (Optional) For the Cancel / Extend buttons, set `SLACK_ALLOWED_USER_IDS` to
 #      a comma-separated list of Slack user IDs (UXXXXXX). Anyone not on the list
 #      gets an ephemeral "not authorized" reply when they click.
+#   9. Re-install the app after applying this manifest (new scopes). Then compare
+#      OAuth & Permissions → Bot User OAuth Token with `SLACK_TOKEN`; if Slack issued
+#      a new token, update `SLACK_TOKEN` and restart.
 #
 # Updating an existing app
 # ────────────────────────
@@ -28,7 +31,9 @@
 # If you already have an app and want to apply this manifest to it:
 #   App settings → "App Manifest" → replace the YAML → "Save Changes".
 # Slack will warn you about scope diffs and prompt for re-installation if needed.
-# Re-installation issues a NEW xoxb- token; update SLACK_TOKEN in .env afterwards.
+# Reinstall the app after applying this manifest (new scopes). Then compare
+# OAuth & Permissions → Bot User OAuth Token with SLACK_TOKEN; if Slack issued a new
+# token, update SLACK_TOKEN and restart. SLACK_APP_TOKEN (xapp-...) is unchanged.
 ---
 _metadata:
   major_version: 1
@@ -56,6 +61,13 @@ features:
     home_tab_enabled: false
     messages_tab_enabled: false
     messages_tab_read_only_enabled: true
+  # Message shortcut: "Correct transcript" in the ⋯ menu of any message. The controller only
+  # accepts it on dispatch alerts and TAC transmission posts of an active rescue.
+  shortcuts:
+    - name: Correct transcript
+      type: message
+      callback_id: correct_transcript
+      description: Correct a mis-transcribed dispatch or radio transmission (one correction per message)
 
 oauth_config:
   scopes:
@@ -67,8 +79,20 @@ oauth_config:
       # chat:write.public — allow posting to public channels without explicit invite.
       # The bot only posts to one channel (SLACK_CHANNEL_ID), so this is convenience
       # rather than necessity. Drop it if you prefer the bot be a member of every
-      # channel it touches.
+      # channel it touches. NOTE: this does not exempt the bot from needing to be a
+      # member of the alert channel to receive `message` events (see below) — invite
+      # it there regardless (/invite @transcribe).
       - chat:write.public
+      # commands — required for the "Correct transcript" message shortcut.
+      - commands
+      # channels:history / groups:history — receive `message` events so `correction:` thread
+      # replies from incident leadership can feed the live interpretation. Every other message is
+      # ignored. Public (channels:*) and private (groups:*) scopes/events are both listed below;
+      # drop whichever channel type your alert channel isn't.
+      - channels:history
+      - groups:history
+      # reactions:write — ✅ / ⚠️ on a `correction:` reply to show whether it was applied.
+      - reactions:write
 
 settings:
   org_deploy_enabled: false
@@ -87,6 +111,11 @@ settings:
     # points at a public endpoint backed by the service.
     is_enabled: true
   event_subscriptions:
-    # No event subscriptions: the bot never reacts to messages, member joins,
-    # reactions, etc. It only handles interactivity (button clicks).
-    bot_events: []
+    # `message` events power `correction:` thread replies. Only allowlisted users' replies in
+    # the alert channel that start with "correction:" are used; everything else is ignored.
+    # Public (message.channels) and private (message.groups) are both listed; drop whichever
+    # channel type your alert channel isn't. The bot must be a member of the alert channel
+    # (/invite @transcribe) to receive these events at all.
+    bot_events:
+      - message.channels
+      - message.groups
