@@ -122,8 +122,9 @@ type RescueSummary struct {
 
 	// SARNotified is true when the TAC chatter clearly indicates Search and Rescue has been
 	// notified / requested / contacted / is responding (phrasing varies widely). Surfaced as a
-	// green-check badge on the alert and in the live interpretation. Latched on the alert: once
-	// a rescue trips this, the parent alert is badged and stays badged.
+	// green-check badge on the alert and in the live interpretation. Not latched: the parent
+	// alert's badge follows the latest summary. The parent is re-rendered at most once per pass,
+	// only on a false→true flip or a brief change.
 	SARNotified bool `json:"sar_notified"`
 
 	// KeyEvents is a chronological list of notable moments. CapturedAt mirrors the input
