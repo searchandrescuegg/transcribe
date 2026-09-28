@@ -318,13 +318,13 @@ func (tc *TranscribeClient) processRecord(ctx context.Context, record *s3event.E
 	}
 
 	if parsedKey.dk.Talkgroup == FireDispatch1TGID {
-		if err := tc.processDispatchCall(ctx, parsedKey, tr); err != nil {
+		if err := tc.processDispatchCall(ctx, parsedKey, tr, fileBytes); err != nil {
 			return fmt.Errorf("failed to process fire dispatch call (talkgroup=%s): %w", parsedKey.dk.Talkgroup, err)
 		}
 		return nil
 	}
 
-	if err := tc.processNonDispatchCall(ctx, parsedKey, tr); err != nil {
+	if err := tc.processNonDispatchCall(ctx, parsedKey, tr, fileBytes); err != nil {
 		return fmt.Errorf("failed to process non-dispatch call (talkgroup=%s): %w", parsedKey.dk.Talkgroup, err)
 	}
 	return nil

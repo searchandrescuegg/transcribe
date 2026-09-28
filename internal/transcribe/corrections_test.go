@@ -142,7 +142,7 @@ func (s *DispatchSuite) TestProcessNonDispatchCall_RecordsPostTSAndS3Key() {
 	slackMock.On("SendMessageContext", mock.Anything, "C-TEST", mock.Anything).Return("C-TEST", "ts-post-1", "", nil).Once()
 
 	parsed := &AdornedDeconstructedKey{dk: &DeconstructedKey{Talkgroup: tgid, Time: time.Now()}, key: "2026/09/27/14/1967/obj.wav"}
-	s.Require().NoError(tc.processNonDispatchCall(s.ctx, parsed, stubASRResponse("on scene")))
+	s.Require().NoError(tc.processNonDispatchCall(s.ctx, parsed, stubASRResponse("on scene"), nil))
 
 	idx, e, found, err := tc.findEntryBySlackTS(s.ctx, tgid, "ts-post-1", entryKindRadio)
 	s.Require().NoError(err)
@@ -168,7 +168,7 @@ func (s *DispatchSuite) TestHandleAdditionalDispatch_PreservesConcurrentDispatch
 
 	slackMock.On("SendMessageContext", mock.Anything, "C-TEST", mock.Anything).Return("C-TEST", "ts-x", "", nil)
 	parsed := &AdornedDeconstructedKey{dk: &DeconstructedKey{Talkgroup: FireDispatch1TGID, Time: time.Now()}}
-	s.Require().NoError(tc.handleAdditionalDispatch(s.ctx, parsed, stubASRResponse("repage"), stale)) // stale copy passed in
+	s.Require().NoError(tc.handleAdditionalDispatch(s.ctx, parsed, stubASRResponse("repage"), stale, nil)) // stale copy passed in
 
 	got, ok := tc.readClosureMeta(s.ctx, tgid)
 	s.Require().True(ok)

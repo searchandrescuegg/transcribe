@@ -221,7 +221,7 @@ func (s *DispatchSuite) TestProcessDispatchCall_HappyPath_TrailRescue() {
 	parsed := &AdornedDeconstructedKey{dk: &DeconstructedKey{Talkgroup: FireDispatch1TGID}}
 	tr := stubASRResponse("raw")
 
-	err := tc.processDispatchCall(s.ctx, parsed, tr)
+	err := tc.processDispatchCall(s.ctx, parsed, tr, nil)
 	s.Require().NoError(err)
 
 	// Allowed_talkgroups should now contain TAC1's TGID.
@@ -258,7 +258,7 @@ func (s *DispatchSuite) TestProcessDispatchCall_NoTrailRescue_IsNoOp() {
 	)
 
 	parsed := &AdornedDeconstructedKey{dk: &DeconstructedKey{Talkgroup: FireDispatch1TGID}}
-	err := tc.processDispatchCall(s.ctx, parsed, stubASRResponse("raw"))
+	err := tc.processDispatchCall(s.ctx, parsed, stubASRResponse("raw"), nil)
 	s.Require().NoError(err)
 
 	// No Slack post, no ZSET entry.
@@ -289,7 +289,7 @@ func (s *DispatchSuite) TestProcessDispatchCall_AdditionalTone_DedupsToExistingT
 	slackMock.On("SendMessageContext", mock.Anything, "C-TEST", mock.Anything).Return("C-TEST", "reply-ts", "", nil).Once()
 
 	parsed := &AdornedDeconstructedKey{dk: &DeconstructedKey{Talkgroup: FireDispatch1TGID, Time: time.Now()}}
-	err := tc.processDispatchCall(s.ctx, parsed, stubASRResponse("raw2"))
+	err := tc.processDispatchCall(s.ctx, parsed, stubASRResponse("raw2"), nil)
 	s.Require().NoError(err)
 
 	mlMock.AssertExpectations(s.T())
@@ -328,7 +328,7 @@ func (s *DispatchSuite) TestProcessDispatchCall_UnknownTACChannel_ReturnsError()
 	)
 
 	parsed := &AdornedDeconstructedKey{dk: &DeconstructedKey{Talkgroup: FireDispatch1TGID}}
-	err := tc.processDispatchCall(s.ctx, parsed, stubASRResponse("raw"))
+	err := tc.processDispatchCall(s.ctx, parsed, stubASRResponse("raw"), nil)
 	s.Require().Error(err)
 	s.ErrorIs(err, ErrFailedToFindTalkgroup)
 
@@ -355,7 +355,7 @@ func (s *DispatchSuite) TestProcessDispatchCall_SlackInitialPostFails_BailsBefor
 		Return("", "", "", errors.New("slack down")).Once()
 
 	parsed := &AdornedDeconstructedKey{dk: &DeconstructedKey{Talkgroup: FireDispatch1TGID}}
-	err := tc.processDispatchCall(s.ctx, parsed, stubASRResponse("raw"))
+	err := tc.processDispatchCall(s.ctx, parsed, stubASRResponse("raw"), nil)
 	s.Require().Error(err)
 	s.ErrorIs(err, ErrFailedToPostSlackMessage)
 
@@ -387,7 +387,7 @@ func (s *DispatchSuite) TestProcessDispatchCall_RateLimitedThenSucceeds() {
 		Return("C-TEST", "ts-after-retry", "", nil).Once()
 
 	parsed := &AdornedDeconstructedKey{dk: &DeconstructedKey{Talkgroup: FireDispatch1TGID}}
-	err := tc.processDispatchCall(s.ctx, parsed, stubASRResponse("raw"))
+	err := tc.processDispatchCall(s.ctx, parsed, stubASRResponse("raw"), nil)
 	s.Require().NoError(err)
 
 	tg := talkgroupFromRadioShortCode["TAC1"]
@@ -416,7 +416,7 @@ func (s *DispatchSuite) TestProcessNonDispatchCall_HappyPath_PostsInThread() {
 		Return("C-TEST", "ts-child", "", nil).Once()
 
 	parsed := &AdornedDeconstructedKey{dk: &DeconstructedKey{Talkgroup: tac1TGID}}
-	err := tc.processNonDispatchCall(s.ctx, parsed, stubASRResponse("update"))
+	err := tc.processNonDispatchCall(s.ctx, parsed, stubASRResponse("update"), nil)
 	s.Require().NoError(err)
 	slackMock.AssertExpectations(s.T())
 }
@@ -427,7 +427,7 @@ func (s *DispatchSuite) TestProcessNonDispatchCall_ThreadIDMissing_ReturnsError(
 	tc := s.newClientUnderTest(slackMock, mlMock)
 
 	parsed := &AdornedDeconstructedKey{dk: &DeconstructedKey{Talkgroup: "1389"}}
-	err := tc.processNonDispatchCall(s.ctx, parsed, stubASRResponse("update"))
+	err := tc.processNonDispatchCall(s.ctx, parsed, stubASRResponse("update"), nil)
 	s.Require().Error(err)
 	s.ErrorIs(err, ErrFailedToGetThreadIDFromDragonfly)
 	slackMock.AssertNotCalled(s.T(), "SendMessageContext", mock.Anything, mock.Anything, mock.Anything)
@@ -445,7 +445,7 @@ func (s *DispatchSuite) TestProcessNonDispatchCall_UnknownTalkgroup_ReturnsError
 	))
 
 	parsed := &AdornedDeconstructedKey{dk: &DeconstructedKey{Talkgroup: "9999"}}
-	err := tc.processNonDispatchCall(s.ctx, parsed, stubASRResponse("update"))
+	err := tc.processNonDispatchCall(s.ctx, parsed, stubASRResponse("update"), nil)
 	s.Require().Error(err)
 	s.ErrorIs(err, ErrFailedToFindTalkgroup)
 	slackMock.AssertNotCalled(s.T(), "SendMessageContext", mock.Anything, mock.Anything, mock.Anything)
@@ -844,7 +844,7 @@ func (s *DispatchSuite) TestProcessNonDispatchCall_CleansBeforePostingAndStoring
 		Return("C-TEST", "ts-x", "", nil).Twice()
 
 	parsed := &AdornedDeconstructedKey{dk: &DeconstructedKey{Talkgroup: tgid, Time: time.Now()}}
-	err := tc.processNonDispatchCall(s.ctx, parsed, stubASRResponse(raw))
+	err := tc.processNonDispatchCall(s.ctx, parsed, stubASRResponse(raw), nil)
 	s.Require().NoError(err)
 
 	mlMock.AssertExpectations(s.T())
