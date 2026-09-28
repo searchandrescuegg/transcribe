@@ -125,8 +125,10 @@ stable; retractions are tombstones (never `LREM`) to preserve that.
 ### `ClosureMeta`
 
 Gains `DispatchCorrection *Correction` (`By`, `At`, `Original`). `Transcription` holds the
-corrected text after a dispatch correction, so cleanup context, CAD correlation, feedback
-prefill, and the sweeper's closed-alert rebuild inherit it without changes.
+corrected text after a dispatch correction, so CAD correlation, feedback prefill, the summary,
+and the sweeper's closed-alert rebuild use the corrected text without changes. The TAC cleanup
+call is the exception: its `DispatchContext` uses `DispatchCorrection.Original` (the raw ASR),
+because human input must never reach `CleanTACTranscript`.
 
 ### New Dragonfly keys (both TTL-only by design)
 
@@ -166,7 +168,9 @@ Same guard/validation; read-modify-write `tac_meta:<TGID>` setting `Transcriptio
 
 `rerenderParentAlert(ctx, meta)` is extracted from `badgeParentAlertSAR`'s rebuild logic and
 renders current SAR badge state, status, and the dispatch correction line. `badgeParentAlertSAR`
-uses it. The sweeper's closed-alert rebuild also renders the correction line.
+uses it, re-reading `tac_meta` first (falling back to the pass's copy only if the read fails):
+a summary pass can spend ~120s in the LLM, and rendering its stale meta would permanently wipe
+a dispatch correction that landed mid-pass. The sweeper's closed-alert rebuild also renders the correction line.
 
 ### Operator corrections
 
@@ -174,6 +178,11 @@ uses it. The sweeper's closed-alert rebuild also renders the correction line.
   `rewrite=false` — additive; rule 15 handles overrides. Runs even with zero TAC traffic, so the
   Live Interpretation can appear from dispatch + correction alone.
 - Edit / remove: `LSET` (text or tombstone), refresh with `rewrite=true`.
+- Edit with text identical to the live note (Slack re-sends `message_changed` for link unfurls
+  etc.): no-op. `UpsertOperatorCorrection` returns `ErrOperatorCorrectionUnchanged` without
+  writing or recording; the controller neither refreshes nor reacts.
+- The controller serializes operations per Slack message (striped in-process mutex keyed by the
+  message ts), so an edit racing a delete for the same note can't resurrect the retraction.
 
 ### Summary refresh and the rewrite signal
 
