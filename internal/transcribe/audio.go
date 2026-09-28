@@ -15,6 +15,10 @@ const (
 	// can't eat the whole worker budget. It counts toward the worker's serial LLM-call-plus-upload
 	// budget alongside TAC cleanup and the summary call — see CLAUDE.md invariant #7.
 	audioUploadTimeout = 20 * time.Second
+	// audioDeadlineReserve: when the worker ctx has less than this left, the upload is skipped.
+	// It leaves room for the summary pass on tight WORKER_TIMEOUT budgets (the code default is
+	// 30s) — the upload is cosmetic, the summary is not. See CLAUDE.md invariant #7.
+	audioDeadlineReserve = 10 * time.Second
 	// maxAudioAttachmentBytes skips pathological files; trunk-recorder calls are far smaller.
 	maxAudioAttachmentBytes = 20 << 20
 )
@@ -42,6 +46,11 @@ func (tc *TranscribeClient) attachAudio(ctx context.Context, threadTS, s3Key, ti
 	filename := path.Base(s3Key)
 	if s3Key == "" || filename == "." || filename == "/" {
 		filename = "audio.wav"
+	}
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < audioDeadlineReserve {
+		slog.Debug("audio attachment skipped: worker budget below reserve",
+			slog.String("key", s3Key), slog.Duration("remaining", time.Until(deadline)))
+		return
 	}
 	uploadCtx, cancel := context.WithTimeout(ctx, audioUploadTimeout)
 	defer cancel()

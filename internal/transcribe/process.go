@@ -166,18 +166,19 @@ func (tc *TranscribeClient) processDispatchCall(ctx context.Context, parsedKey *
 		slog.Error("failed to persist TAC closure schedule", slog.String("error", err.Error()), slog.String("tac_channel", dispatchMessage.TACChannel))
 	}
 
-	// Attach the dispatch audio as the first reply in the alert thread. Only after the rescue is
-	// fully registered (allow-list, routing, closure) so a slow/failed upload can never delay or
-	// block monitoring. Best-effort.
-	tc.attachAudio(ctx, tsThread, parsedKey.key, audioTitle(dispatchChannelName(), parsedKey.dk.Time), audio)
-
 	// Warm the CAD unit-context cache for this rescue (best-effort, no-op when enrichment is
 	// disabled). Resolving here — right after we know the incident is a trail rescue — means the
 	// first TAC transmission already has a unit roster to canonicalize against, and the dispatch
 	// capture time anchors incident-recency scoring. Failures are swallowed inside the helper.
+	// Runs BEFORE the audio upload: the warm-up serves monitoring, the upload is cosmetic.
 	if tc.unitResolver != nil {
 		tc.resolveAndCacheUnitContext(ctx, tg.TGID, tr.Transcription, parsedKey.dk.Time)
 	}
+
+	// Attach the dispatch audio as the first reply in the alert thread. Last, only after the
+	// rescue is fully registered (allow-list, routing, closure, CAD warm-up), so a slow/failed
+	// upload can never delay or block monitoring. Best-effort.
+	tc.attachAudio(ctx, tsThread, parsedKey.key, audioTitle(dispatchChannelName(), parsedKey.dk.Time), audio)
 
 	return nil
 }
@@ -271,19 +272,35 @@ func (tc *TranscribeClient) processNonDispatchCall(ctx context.Context, parsedKe
 
 	slog.Debug("posted transcription message to Slack", slog.String("talkgroup", parsedKey.dk.Talkgroup), slog.String("thread_id", tsThread))
 
-	// Audio right under its transcript, before the (slow) summary refresh. Best-effort.
-	tc.attachAudio(ctx, tsThread, parsedKey.key, audioTitle(tgInfo.FullName, parsedKey.dk.Time), audio)
-
-	// Roll the live interpretation forward with the CLEANED text, remembering the post ts and S3
-	// key so the "Correct transcript" shortcut can find and amend this exact entry later.
-	tc.appendAndRefresh(ctx, parsedKey.dk.Talkgroup, liveTranscriptEntry{
+	// Store the transmission FIRST, then upload audio, then refresh the summary. The entry is
+	// built with the CLEANED text plus the post ts and S3 key so the "Correct transcript" shortcut
+	// can find and amend this exact entry later. Storing before the upload means a slow upload
+	// that burns the worker budget can never keep the transmission out of tac_transcripts (it
+	// would otherwise be missing from every later summary and uncorrectable).
+	entry := liveTranscriptEntry{
 		CapturedAt: parsedKey.dk.Time.Format("15:04:05"),
 		Text:       cleaned,
 		Kind:       entryKindRadio,
 		PostedAt:   postedAt.Format(time.RFC3339),
 		SlackTS:    postTS,
 		S3Key:      parsedKey.key,
-	})
+	}
+	stored := false
+	if entry.Text != "" {
+		if err := tc.appendEntry(ctx, parsedKey.dk.Talkgroup, entry); err != nil {
+			slog.Warn("live interpretation: append failed", slog.String("error", err.Error()), slog.String("tgid", parsedKey.dk.Talkgroup))
+		} else {
+			stored = true
+		}
+	}
+
+	// Audio right under its transcript, before the (slow) summary refresh. Best-effort; skipped
+	// when too little worker budget remains for the summary (see attachAudio).
+	tc.attachAudio(ctx, tsThread, parsedKey.key, audioTitle(tgInfo.FullName, parsedKey.dk.Time), audio)
+
+	if stored {
+		tc.RefreshLiveInterpretation(ctx, parsedKey.dk.Talkgroup, false)
+	}
 	return nil
 }
 

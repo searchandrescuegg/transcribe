@@ -65,8 +65,9 @@ const (
 )
 
 // updateLiveInterpretation appends one radio transcript and refreshes the running summary.
-// Kept for callers/tests that only have text; processNonDispatchCall uses appendAndRefresh
-// directly so it can record the Slack post ts and S3 key.
+// Kept for callers/tests that only have text; processNonDispatchCall calls appendEntry and
+// RefreshLiveInterpretation directly so it can record the Slack post ts and S3 key and upload
+// audio between the two.
 func (tc *TranscribeClient) updateLiveInterpretation(ctx context.Context, tacTGID string, capturedAt time.Time, transcript string) {
 	tc.appendAndRefresh(ctx, tacTGID, liveTranscriptEntry{
 		CapturedAt: capturedAt.Format("15:04:05"),

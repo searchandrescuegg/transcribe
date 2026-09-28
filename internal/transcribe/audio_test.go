@@ -1,6 +1,7 @@
 package transcribe
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,13 @@ import (
 	"github.com/stretchr/testify/mock"
 )
 
+// stubUnitResolver is a fixed-answer UnitResolver for ordering tests.
+type stubUnitResolver struct{ block string }
+
+func (r stubUnitResolver) RescueUnitBlock(context.Context, string, time.Time) (string, error) {
+	return r.block, nil
+}
+
 func TestAudioTitle(t *testing.T) {
 	at := time.Date(2026, 9, 27, 14, 2, 11, 0, time.Local)
 	assert.Equal(t, "TAC 10 · 14:02:11", audioTitle("TAC 10", at))
@@ -26,7 +34,8 @@ func (s *DispatchSuite) TestAttachAudio_UploadsIntoThread() {
 	tc.config.AudioAttachmentsEnabled = true
 	audio := []byte("RIFF....WAVEfmt ")
 
-	slackMock.On("UploadFileV2Context", mock.Anything, mock.MatchedBy(func(p slack.UploadFileV2Parameters) bool {
+	hasDeadline := mock.MatchedBy(func(ctx context.Context) bool { _, ok := ctx.Deadline(); return ok })
+	slackMock.On("UploadFileV2Context", hasDeadline, mock.MatchedBy(func(p slack.UploadFileV2Parameters) bool {
 		return p.Channel == "C-TEST" && p.ThreadTimestamp == "ts-thread" &&
 			p.Filename == "1967-1777832063_852162500.0-call_002.wav" &&
 			p.Title == "TAC 10 · 14:02:11" && p.FileSize == len(audio) && p.Reader != nil
@@ -80,7 +89,13 @@ func (s *DispatchSuite) TestTACPath_AttachesAudioAfterPostBeforeSummary() {
 	slackMock.On("SendMessageContext", mock.Anything, "C-TEST", mock.Anything).Run(rec("post")).Return("C-TEST", "ts-post", "", nil)
 	slackMock.On("UploadFileV2Context", mock.Anything, mock.MatchedBy(func(p slack.UploadFileV2Parameters) bool {
 		return p.ThreadTimestamp == "ts-rescue" && p.Filename == "1967-x.wav"
-	})).Run(rec("upload")).Return(&slack.FileSummary{ID: "F1"}, nil).Once()
+	})).Run(func(args mock.Arguments) {
+		// The transmission must already be durable in tac_transcripts before the upload starts.
+		_, _, found, err := tc.findEntryBySlackTS(s.ctx, tgid, "ts-post", entryKindRadio)
+		s.NoError(err)
+		s.True(found, "entry stored before audio upload")
+		rec("upload")(args)
+	}).Return(&slack.FileSummary{ID: "F1"}, nil).Once()
 	mlMock.On("SummarizeRescue", mock.Anything, mock.Anything).Run(rec("summary")).Return(&ml.RescueSummary{Headline: "h"}, nil).Once()
 
 	parsed := &AdornedDeconstructedKey{dk: &DeconstructedKey{Talkgroup: tgid, Time: time.Now()}, key: "2026/09/27/14/1967/1967-x.wav"}
@@ -96,6 +111,8 @@ func (s *DispatchSuite) TestDispatchPath_AttachesAudioToAlertThreadAfterRegistra
 	slackMock, mlMock := new(mockSlackPoster), new(mockMLClient)
 	tc := s.newClientUnderTest(slackMock, mlMock)
 	tc.config.AudioAttachmentsEnabled = true
+	tc.config.PulpoRefreshInterval = time.Minute
+	tc.unitResolver = stubUnitResolver{block: "UNITS: M1"}
 	mlMock.On("ParseRelevantInformationFromDispatchMessage", mock.Anything, "raw").Return(
 		dispatchMessages(ml.DispatchMessage{CallType: "Rescue - Trail", TACChannel: "TAC1", CleanedTranscription: "rescue trail call"}), nil)
 	slackMock.On("SendMessageContext", mock.Anything, "C-TEST", mock.Anything).Return("C-TEST", "ts-rescue-1", "", nil).Once()
@@ -105,6 +122,10 @@ func (s *DispatchSuite) TestDispatchPath_AttachesAudioToAlertThreadAfterRegistra
 		return p.ThreadTimestamp == "ts-rescue-1"
 	})).Run(func(mock.Arguments) {
 		// By upload time the rescue must already be registered.
+		routed, _ := tc.dragonflyClient.Get(s.ctx, fmt.Sprintf(talkgroupKeyPrefix, tg.TGID))
+		s.Equal("ts-rescue-1", routed, "tg:<TGID> routing set before audio upload")
+		cached, _ := tc.dragonflyClient.Get(s.ctx, fmt.Sprintf(pulpoUnitsKeyFmt, tg.TGID))
+		s.Equal("UNITS: M1", cached, "CAD unit cache warmed before audio upload")
 		isMember, _ := tc.dragonflyClient.SMisMember(s.ctx, "allowed_talkgroups", tg.TGID)
 		s.Equal([]bool{true}, isMember, "allow-listed before audio upload")
 		n, _ := s.rdb.ZCard(s.ctx, activeTACsKey).Result()
@@ -148,5 +169,47 @@ func (s *DispatchSuite) TestAudio_FlagOff_NoUploadOnTACPath() {
 
 	parsed := &AdornedDeconstructedKey{dk: &DeconstructedKey{Talkgroup: tgid}, key: "k.wav"}
 	s.Require().NoError(tc.processNonDispatchCall(s.ctx, parsed, stubASRResponse("update"), []byte("wav")))
+	slackMock.AssertNotCalled(s.T(), "UploadFileV2Context", mock.Anything, mock.Anything)
+}
+
+// Final review #1: a slow upload that exhausts the worker ctx must not lose the transmission —
+// the entry is stored in tac_transcripts BEFORE the upload runs. The mock cancels the worker ctx
+// (simulating the budget running out mid-upload) and blocks until its own ctx is done.
+func (s *DispatchSuite) TestTACPath_EntryStoredEvenWhenUploadHangs() {
+	slackMock, mlMock := new(mockSlackPoster), new(mockMLClient)
+	tc := s.newClientUnderTest(slackMock, mlMock)
+	tc.config.AudioAttachmentsEnabled = true
+	tgid := talkgroupFromRadioShortCode["TAC10"].TGID
+	s.Require().NoError(tc.dragonflyClient.Set(s.ctx, fmt.Sprintf(talkgroupKeyPrefix, tgid), time.Hour, "ts-rescue"))
+
+	workerCtx, cancelWorker := context.WithCancel(s.ctx)
+	defer cancelWorker()
+	slackMock.On("SendMessageContext", mock.Anything, "C-TEST", mock.Anything).Return("C-TEST", "ts-post-hang", "", nil)
+	slackMock.On("UploadFileV2Context", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+		cancelWorker()
+		<-args.Get(0).(context.Context).Done()
+	}).Return(nil, context.Canceled).Once()
+	mlMock.On("SummarizeRescue", mock.Anything, mock.Anything).Return(&ml.RescueSummary{Headline: "h"}, nil).Maybe()
+
+	parsed := &AdornedDeconstructedKey{dk: &DeconstructedKey{Talkgroup: tgid, Time: time.Now()}, key: "2026/09/27/14/1967/1967-hang.wav"}
+	s.Require().NoError(tc.processNonDispatchCall(workerCtx, parsed, stubASRResponse("on scene"), []byte("wav")))
+
+	_, e, found, err := tc.findEntryBySlackTS(s.ctx, tgid, "ts-post-hang", entryKindRadio)
+	s.Require().NoError(err)
+	s.True(found, "transmission must be in tac_transcripts despite the hung upload")
+	s.Equal("on scene", e.Text)
+	slackMock.AssertExpectations(s.T())
+}
+
+// Final review #1: with less than audioDeadlineReserve of the worker budget left, the upload is
+// skipped so the summary pass still has room (CLAUDE.md invariant #7).
+func (s *DispatchSuite) TestAttachAudio_SkipsWhenWorkerBudgetBelowReserve() {
+	slackMock := new(mockSlackPoster)
+	tc := s.newClientUnderTest(slackMock, new(mockMLClient))
+	tc.config.AudioAttachmentsEnabled = true
+	ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
+	defer cancel()
+
+	tc.attachAudio(ctx, "ts", "k.wav", "t", []byte("x"))
 	slackMock.AssertNotCalled(s.T(), "UploadFileV2Context", mock.Anything, mock.Anything)
 }
