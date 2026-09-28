@@ -154,19 +154,25 @@ func (c *Controller) correctionOpLock(slackTS string) *sync.Mutex {
 	return &c.correctionOpLocks[h.Sum32()%correctionOpLockStripes]
 }
 
-// handleCorrectionOp applies one `correction:` note operation. Held under the message's stripe
-// lock for its whole duration: dispatchEvent runs each event in its own goroutine, and an edit
-// racing a delete for the same message could otherwise read the live entry, lose the race, and
-// write Deleted=false over the retraction (resurrecting it).
+// handleCorrectionOp applies one `correction:` note operation. The stripe lock is scoped
+// narrowly to the storage read-modify-write (Upsert/Remove) ONLY — that's the sole step where an
+// edit racing a delete for the same message could read the live entry, lose the race, and write
+// Deleted=false over the retraction (resurrecting it). react and RefreshLiveInterpretation run
+// after the lock is released: refresh reads whatever state is current when it runs, so its
+// ordering relative to other ops doesn't matter, but it can take minutes (up to 5 summary passes
+// of ~120s each while it holds the per-TGID summary lock). Holding the stripe lock across it would
+// stall any other op on the same message — or a same-stripe collision, ~1/64 of messages — behind
+// a multi-minute refresh, risking that op's own WorkerTimeout-bounded context expiring in the
+// queue and silently dropping an edit or retraction.
 func (c *Controller) handleCorrectionOp(ctx context.Context, op correctionOp) {
 	mu := c.correctionOpLock(op.MessageTS)
-	mu.Lock()
-	defer mu.Unlock()
 
 	switch op.Kind {
 	case correctionOpUpsert:
 		at := slackTSTime(op.MessageTS)
+		mu.Lock()
 		tgid, created, err := c.corrections.UpsertOperatorCorrection(ctx, op.ThreadTS, op.MessageTS, op.UserID, op.Text, at)
+		mu.Unlock()
 		if errors.Is(err, transcribe.ErrRescueNotActive) {
 			return // not an active rescue thread — ignore
 		}
@@ -183,7 +189,9 @@ func (c *Controller) handleCorrectionOp(ctx context.Context, op correctionOp) {
 		}
 		c.corrections.RefreshLiveInterpretation(ctx, tgid, !created)
 	case correctionOpRemove:
+		mu.Lock()
 		tgid, removed, err := c.corrections.RemoveOperatorCorrection(ctx, op.ThreadTS, op.MessageTS, op.UserID)
+		mu.Unlock()
 		if err != nil {
 			slog.Warn("slackctl: retract correction failed", slog.String("error", err.Error()), slog.String("ts", op.MessageTS))
 			return

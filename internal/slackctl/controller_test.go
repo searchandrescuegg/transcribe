@@ -317,6 +317,13 @@ type fakeCorrections struct {
 	removeCalls   []removeCall
 
 	refreshCalls []refreshCall
+	// Optional: when refreshBlockN > 0, that many leading RefreshLiveInterpretation calls signal
+	// refreshEntered then block until refreshRelease is closed (outside mu), so tests can hold a
+	// refresh "in progress" — e.g. to prove it no longer holds the per-message stripe lock.
+	refreshBlockN  int
+	refreshBlocked int
+	refreshEntered chan struct{}
+	refreshRelease chan struct{}
 }
 
 func (f *fakeCorrections) ResolveCorrectionTarget(context.Context, string, string) (transcribe.CorrectionTarget, error) {
@@ -353,8 +360,19 @@ func (f *fakeCorrections) MigrateOperatorCorrections(_ context.Context, oldTGID,
 }
 func (f *fakeCorrections) RefreshLiveInterpretation(_ context.Context, tgid string, rewrite bool) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.refreshCalls = append(f.refreshCalls, refreshCall{tgid, rewrite})
+	var entered, release chan struct{}
+	if f.refreshBlocked < f.refreshBlockN {
+		f.refreshBlocked++
+		entered, release = f.refreshEntered, f.refreshRelease
+	}
+	f.mu.Unlock()
+	if entered != nil {
+		entered <- struct{}{}
+	}
+	if release != nil {
+		<-release
+	}
 }
 
 func (f *fakeCorrections) upsertCallCount() int {

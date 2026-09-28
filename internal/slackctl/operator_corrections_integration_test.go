@@ -302,3 +302,49 @@ func (s *SlackctlSuite) TestHandleCorrectionOp_SameMessage_Serialized() {
 	wg.Wait()
 	s.Equal(2, fake.upsertCallCount())
 }
+
+// A second op for the same message must NOT be blocked by the first op's RefreshLiveInterpretation
+// — only the storage read-modify-write is serialized. Refresh can run for minutes (up to 5 summary
+// passes at ~120s each while it holds the per-TGID summary lock); if the stripe lock were held
+// across it, an edit or delete racing that refresh would queue behind it and could lose the race
+// against its own WorkerTimeout-bounded context, silently dropping the edit or retraction.
+func (s *SlackctlSuite) TestHandleCorrectionOp_SameMessage_NotBlockedByRefresh() {
+	fake := &fakeCorrections{upsertTGID: "1389", upsertCreated: false,
+		refreshBlockN: 1, refreshEntered: make(chan struct{}, 2), refreshRelease: make(chan struct{})}
+	s.controller.corrections = fake
+	op := correctionOp{Kind: correctionOpUpsert, ThreadTS: "100.0", MessageTS: "200.2", UserID: "U1", Text: "x"}
+
+	firstDone := make(chan struct{})
+	go func() {
+		s.controller.handleCorrectionOp(s.ctx, op)
+		close(firstDone)
+	}()
+
+	// Wait for the first op's refresh to start — at this point its storage call has already
+	// returned and released the stripe lock, and it's now blocked inside RefreshLiveInterpretation.
+	select {
+	case <-fake.refreshEntered:
+	case <-time.After(2 * time.Second):
+		s.FailNow("first op's refresh never started")
+	}
+
+	secondDone := make(chan struct{})
+	go func() {
+		s.controller.handleCorrectionOp(s.ctx, op)
+		close(secondDone)
+	}()
+
+	select {
+	case <-secondDone:
+	case <-time.After(200 * time.Millisecond):
+		s.Fail("second op was blocked while the first op's refresh was still running")
+	}
+	s.Equal(2, fake.upsertCallCount(), "second op must have reached the storage call promptly")
+
+	close(fake.refreshRelease)
+	select {
+	case <-firstDone:
+	case <-time.After(2 * time.Second):
+		s.Fail("first op never finished after its refresh was released")
+	}
+}
