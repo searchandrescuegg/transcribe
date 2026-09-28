@@ -296,15 +296,22 @@ func (tc *TranscribeClient) maybeCleanTranscript(ctx context.Context, tgid, raw 
 		defer cancel()
 	}
 
-	var dispatchText string
+	// Two dispatch texts on purpose. After a dispatch correction, meta.Transcription is
+	// human-typed: it is the better key for CAD/unit correlation, but human input must NEVER
+	// reach CleanTACTranscript (cleanup is phonetic-only and must fail safe — it may not borrow
+	// words a human typed), so the cleanup context stays the original ASR text.
+	var dispatchText, cleanupContext string
 	if meta, ok := tc.readClosureMeta(cleanCtx, tgid); ok {
-		dispatchText = meta.Transcription
+		dispatchText, cleanupContext = meta.Transcription, meta.Transcription
+		if meta.DispatchCorrection != nil {
+			cleanupContext = meta.DispatchCorrection.Original
+		}
 	}
 	unitContext := tc.unitContextFor(cleanCtx, tgid, dispatchText, time.Now())
 
 	res, err := tc.mlClient.CleanTACTranscript(cleanCtx, ml.TACCleanupInput{
 		Text:            raw,
-		DispatchContext: dispatchText,
+		DispatchContext: cleanupContext,
 		UnitContext:     unitContext,
 	})
 	if err != nil {

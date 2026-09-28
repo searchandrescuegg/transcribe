@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/searchandrescuegg/transcribe/internal/transcribe"
@@ -141,13 +143,35 @@ func (c *Controller) dispatchEvent(evt *socketmode.Event, client *socketmode.Cli
 	}()
 }
 
+// correctionOpLockStripes is the number of striped mutexes serializing operations per Slack
+// message. Collisions only cost a little unnecessary serialization; nothing ever leaks.
+const correctionOpLockStripes = 64
+
+// correctionOpLock returns the stripe guarding operations on the note posted as slackTS.
+func (c *Controller) correctionOpLock(slackTS string) *sync.Mutex {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(slackTS))
+	return &c.correctionOpLocks[h.Sum32()%correctionOpLockStripes]
+}
+
+// handleCorrectionOp applies one `correction:` note operation. Held under the message's stripe
+// lock for its whole duration: dispatchEvent runs each event in its own goroutine, and an edit
+// racing a delete for the same message could otherwise read the live entry, lose the race, and
+// write Deleted=false over the retraction (resurrecting it).
 func (c *Controller) handleCorrectionOp(ctx context.Context, op correctionOp) {
+	mu := c.correctionOpLock(op.MessageTS)
+	mu.Lock()
+	defer mu.Unlock()
+
 	switch op.Kind {
 	case correctionOpUpsert:
 		at := slackTSTime(op.MessageTS)
 		tgid, created, err := c.corrections.UpsertOperatorCorrection(ctx, op.ThreadTS, op.MessageTS, op.UserID, op.Text, at)
 		if errors.Is(err, transcribe.ErrRescueNotActive) {
 			return // not an active rescue thread — ignore
+		}
+		if errors.Is(err, transcribe.ErrOperatorCorrectionUnchanged) {
+			return // same text re-sent (link unfurl etc.) — nothing changed, don't force a rewrite
 		}
 		if err != nil {
 			slog.Warn("slackctl: store correction failed", slog.String("error", err.Error()), slog.String("ts", op.MessageTS))

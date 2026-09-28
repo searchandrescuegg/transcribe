@@ -306,11 +306,26 @@ func (tc *TranscribeClient) publishLiveInterpretation(ctx context.Context, tacTG
 // "Expires …" line stays accurate — including after an Extend — without threading the expiry
 // through ClosureMeta. If the expiry can't be read (rescue already closing/closed), skip
 // rather than render a bogus timestamp.
+//
+// meta is re-read first: the caller's copy was read at the start of a summary pass that may
+// have spent ~120s in the LLM, and a dispatch correction landing in that window would otherwise
+// be rendered away — permanently, since corrections are one-shot. The passed meta is only a
+// fallback for a failed/missing read.
 func (tc *TranscribeClient) badgeParentAlertSAR(ctx context.Context, tgid string, meta ClosureMeta) {
+	meta = tc.freshClosureMeta(ctx, tgid, meta)
 	if tc.rerenderParentAlert(ctx, meta, true, fmt.Sprintf("%s — Search & Rescue notified", meta.TACChannel)) {
 		slog.Info("live interpretation: badged parent alert — SAR notified",
 			slog.String("tgid", tgid), slog.String("tac", meta.TACChannel))
 	}
+}
+
+// freshClosureMeta re-reads tac_meta:<TGID>, returning fallback when the read fails or the key
+// is gone.
+func (tc *TranscribeClient) freshClosureMeta(ctx context.Context, tgid string, fallback ClosureMeta) ClosureMeta {
+	if fresh, ok := tc.readClosureMeta(ctx, tgid); ok {
+		return fresh
+	}
+	return fallback
 }
 
 // sendSlackInThread is a convenience wrapper that goes through sendSlackWithRetry and also

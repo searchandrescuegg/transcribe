@@ -247,3 +247,58 @@ func (s *SlackctlSuite) TestHandleCorrectionOp_Remove_NothingToRemove_NoRefresh(
 	_, _, refreshes := fake.snapshot()
 	s.Empty(refreshes, "removing an already-tombstoned (or never-live) note must not refresh")
 }
+
+// An edit whose text is unchanged (Slack link unfurl etc.) is a no-op: no refresh, no reaction.
+func (s *SlackctlSuite) TestHandleCorrectionOp_Upsert_Unchanged_NoRefreshNoReaction() {
+	const ch = "C1"
+	s.controller.cfg.SlackChannelID = ch
+	srv, rec := newReactionServer()
+	defer srv.Close()
+	s.controller.slackClient = slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/"))
+
+	fake := &fakeCorrections{upsertTGID: "1389", upsertErr: transcribe.ErrOperatorCorrectionUnchanged}
+	s.controller.corrections = fake
+
+	op := correctionOp{Kind: correctionOpUpsert, ThreadTS: "100.0", MessageTS: "200.1", UserID: "U1", Text: "same text"}
+	s.controller.handleCorrectionOp(s.ctx, op)
+
+	_, _, refreshes := fake.snapshot()
+	s.Empty(refreshes, "an unchanged edit must not force a summary rewrite")
+	time.Sleep(150 * time.Millisecond)
+	s.Empty(rec.snapshot(), "an unchanged edit must not react (not even a warning)")
+}
+
+// Two operations on the same Slack message are serialized: the second must not enter the
+// service until the first returns (else an edit's stale read can resurrect a retracted note).
+func (s *SlackctlSuite) TestHandleCorrectionOp_SameMessage_Serialized() {
+	fake := &fakeCorrections{upsertTGID: "1389", upsertCreated: false,
+		upsertEntered: make(chan struct{}, 2), upsertRelease: make(chan struct{})}
+	s.controller.corrections = fake
+	op := correctionOp{Kind: correctionOpUpsert, ThreadTS: "100.0", MessageTS: "200.1", UserID: "U1", Text: "x"}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); s.controller.handleCorrectionOp(s.ctx, op) }()
+	select {
+	case <-fake.upsertEntered:
+	case <-time.After(2 * time.Second):
+		s.FailNow("first op never entered the service")
+	}
+	go func() { defer wg.Done(); s.controller.handleCorrectionOp(s.ctx, op) }()
+
+	select {
+	case <-fake.upsertEntered:
+		s.Fail("second op entered the service while the first was still inside it")
+	case <-time.After(200 * time.Millisecond):
+	}
+	s.Equal(1, fake.upsertCallCount())
+
+	close(fake.upsertRelease)
+	select {
+	case <-fake.upsertEntered:
+	case <-time.After(2 * time.Second):
+		s.Fail("second op never ran after the first returned")
+	}
+	wg.Wait()
+	s.Equal(2, fake.upsertCallCount())
+}

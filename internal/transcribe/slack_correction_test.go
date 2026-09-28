@@ -46,3 +46,16 @@ func TestCorrectionLabel_OnlyWhenCorrected(t *testing.T) {
 	// Label sits directly after the preformatted transcription (index 3 → label at 4).
 	assert.Contains(t, blocksJSON(t, alert[4]), "Corrected by")
 }
+
+// SAR badge and dispatch-correction label must coexist: badge directly after the header,
+// label directly after the transcription.
+func TestBuildRescueTrailBlocks_SARBadgeAndCorrectionLabelTogether(t *testing.T) {
+	alert := BuildRescueTrailBlocks(&RescueTrailBlocksInput{TACChannel: "TAC10", TranscriptionText: "fixed dispatch",
+		ExpiresAt: time.Now(), DispatchTGID: "1399", SARNotified: true,
+		Correction: &TranscriptCorrection{By: "U1", At: time.Now(), Original: "o"}})
+	require.GreaterOrEqual(t, len(alert), 6)
+	assert.Contains(t, blocksJSON(t, alert[0]), "Rescue Trail", "header first")
+	assert.Contains(t, blocksJSON(t, alert[1]), "Rescue notified", "SAR badge directly after header")
+	assert.Contains(t, blocksJSON(t, alert[4]), "fixed dispatch", "transcription")
+	assert.Contains(t, blocksJSON(t, alert[5]), "Corrected by", "label directly after transcription")
+}

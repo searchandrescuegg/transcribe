@@ -2,6 +2,7 @@ package transcribe
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -9,10 +10,17 @@ import (
 	"github.com/searchandrescuegg/transcribe/internal/dataset"
 )
 
+// ErrOperatorCorrectionUnchanged is returned by UpsertOperatorCorrection when an edit carries the
+// exact text already stored for a live note (Slack re-sends message_changed for link unfurls and
+// the like). Nothing was written and nothing was recorded; callers must treat it as "do nothing"
+// — no summary refresh, no reaction.
+var ErrOperatorCorrectionUnchanged = errors.New("operator correction unchanged")
+
 // UpsertOperatorCorrection stores (or, for an already-seen slackTS, amends) a `correction:`
 // thread note on the active rescue whose thread is threadTS. Returns created=true for a new
 // note. The caller refreshes the summary with rewrite = !created: a new note is additive
-// (rule 15 overrides conflicts), an edit may retract facts so it re-derives.
+// (rule 15 overrides conflicts), an edit may retract facts so it re-derives. An edit whose text
+// matches the live note returns ErrOperatorCorrectionUnchanged (no write, no dataset row).
 func (tc *TranscribeClient) UpsertOperatorCorrection(ctx context.Context, threadTS, slackTS, userID, text string, at time.Time) (string, bool, error) {
 	tgid, _, ok, err := tc.LookupTGIDByThread(ctx, threadTS)
 	if err != nil {
@@ -27,6 +35,9 @@ func (tc *TranscribeClient) UpsertOperatorCorrection(ctx context.Context, thread
 		return tgid, false, err
 	}
 	if found {
+		if e.Text == text && !e.Deleted {
+			return tgid, false, ErrOperatorCorrectionUnchanged
+		}
 		prior := e.Text
 		e.Text, e.Deleted = text, false
 		if err := tc.setEntry(ctx, tgid, idx, e); err != nil {

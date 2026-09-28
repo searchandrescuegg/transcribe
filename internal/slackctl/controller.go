@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 
 	"github.com/searchandrescuegg/transcribe/internal/config"
 	"github.com/searchandrescuegg/transcribe/internal/dragonfly"
@@ -43,6 +44,10 @@ type Controller struct {
 	// corrections drives human transcript corrections and `correction:` notes. Nil disables
 	// them (tests that only exercise cancel/extend/switch construct the controller without it).
 	corrections CorrectionService
+
+	// correctionOpLocks serializes `correction:` note operations per Slack message (striped by
+	// a hash of the message ts; see handleCorrectionOp). Zero value is ready to use.
+	correctionOpLocks [correctionOpLockStripes]sync.Mutex
 }
 
 // New constructs the controller. Returns ErrSocketModeDisabled if SLACK_APP_TOKEN is
@@ -113,8 +118,10 @@ func (c *Controller) Run(ctx context.Context) error {
 	return nil
 }
 
-// dispatch fans block_actions out to the typed handlers. Other interactivity types
-// (modal submits, view closes, etc.) are ack'd and ignored.
+// dispatch fans block_actions and message shortcuts out to the typed handlers. The one
+// exception to blanket-acking is the correction modal's view_submission, which is handed to
+// handleCorrectionSubmission so it can ack WITH a payload (inline validation errors). Other
+// interactivity types (other modal submits, view closes, etc.) are ack'd and ignored.
 func (c *Controller) dispatch(evt *socketmode.Event, client *socketmode.Client) {
 	payload, ok := evt.Data.(slack.InteractionCallback)
 	if !ok {

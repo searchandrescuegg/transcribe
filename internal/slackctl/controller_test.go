@@ -306,6 +306,10 @@ type fakeCorrections struct {
 	upsertCreated bool
 	upsertErr     error
 	upsertCalls   []upsertCall
+	// Optional: when set, each Upsert signals upsertEntered then blocks until upsertRelease is
+	// closed (outside mu), so tests can hold an operation "inside" the service.
+	upsertEntered chan struct{}
+	upsertRelease chan struct{}
 
 	removeTGID    string
 	removeRemoved bool
@@ -323,9 +327,17 @@ func (f *fakeCorrections) ApplyTranscriptCorrection(context.Context, transcribe.
 }
 func (f *fakeCorrections) UpsertOperatorCorrection(_ context.Context, threadTS, slackTS, userID, text string, at time.Time) (string, bool, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.upsertCalls = append(f.upsertCalls, upsertCall{threadTS, slackTS, userID, text, at})
-	return f.upsertTGID, f.upsertCreated, f.upsertErr
+	entered, release := f.upsertEntered, f.upsertRelease
+	tgid, created, err := f.upsertTGID, f.upsertCreated, f.upsertErr
+	f.mu.Unlock()
+	if entered != nil {
+		entered <- struct{}{}
+	}
+	if release != nil {
+		<-release
+	}
+	return tgid, created, err
 }
 func (f *fakeCorrections) RemoveOperatorCorrection(_ context.Context, threadTS, slackTS, userID string) (string, bool, error) {
 	f.mu.Lock()
@@ -392,6 +404,10 @@ func TestCorrectionErrorMessage(t *testing.T) {
 	assert.Contains(t, correctionErrorMessage(transcribe.ErrEmptyCorrection), "empty")
 	assert.Contains(t, correctionErrorMessage(transcribe.ErrUnchangedCorrection), "unchanged")
 	assert.Contains(t, correctionErrorMessage(errors.New("x")), "check service logs")
+	// Loser whose read of the winner's correction failed: no empty "<@> at 00:00".
+	empty := correctionErrorMessage(&transcribe.AlreadyCorrectedError{})
+	assert.Contains(t, empty, "already been corrected")
+	assert.NotContains(t, empty, "<@>")
 }
 
 func TestParseOldTGIDFromBlockID(t *testing.T) {

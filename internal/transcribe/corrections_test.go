@@ -10,6 +10,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/searchandrescuegg/transcribe/internal/dataset"
 	"github.com/searchandrescuegg/transcribe/internal/ml"
+	"github.com/slack-go/slack"
 	"github.com/stretchr/testify/mock"
 )
 
@@ -434,4 +435,88 @@ func (s *DispatchSuite) TestMigrateOperatorCorrections_CopiesLiveNotesOnly() {
 	s.Require().Len(entries, 1, "radio entries and tombstones are not migrated")
 	s.Equal("keep me", entries[0].Text)
 	s.Equal("ts-a", entries[0].SlackTS, "slack ts preserved so later edits/deletes still resolve")
+}
+
+// Human-typed dispatch text must never reach CleanTACTranscript (cleanup is phonetic-only and
+// must fail safe). After a dispatch correction the cleanup context is the ORIGINAL ASR text,
+// while CAD correlation keeps the corrected text.
+func (s *DispatchSuite) TestMaybeCleanTranscript_DispatchCorrected_UsesOriginalASRAsContext() {
+	mlMock := new(mockMLClient)
+	tc := s.newClientUnderTest(new(mockSlackPoster), mlMock)
+	tc.config.TACCleanupEnabled = true
+	tgid := talkgroupFromRadioShortCode["TAC10"].TGID
+	meta := ClosureMeta{TGID: tgid, TACChannel: "TAC10", ThreadTS: "ts-rescue", SourceTalkgroup: FireDispatch1TGID,
+		MessageTS: "ts-rescue", Transcription: "Rescue Trail TAC 10 Mailbox Peak (human typed)",
+		DispatchCorrection: &TranscriptCorrection{By: "U1", At: time.Now(), Original: "rescue trail tack ten mailbox peek"}}
+	payload, _ := json.Marshal(meta)
+	s.Require().NoError(tc.dragonflyClient.Set(s.ctx, fmt.Sprintf(tacMetaKeyFmt, tgid), time.Hour, string(payload)))
+
+	mlMock.On("CleanTACTranscript", mock.Anything, mock.MatchedBy(func(in ml.TACCleanupInput) bool {
+		return in.DispatchContext == meta.DispatchCorrection.Original
+	})).Return(&ml.TACCleanupResult{CleanedText: "cleaned"}, nil).Once()
+
+	s.Equal("cleaned", tc.maybeCleanTranscript(s.ctx, tgid, "raw"))
+	mlMock.AssertExpectations(s.T())
+}
+
+// A summary pass can take ~120s in the LLM. If a dispatch correction lands mid-pass, the SAR
+// badge re-render must use the FRESH tac_meta — rendering the stale copy would permanently wipe
+// the (one-shot) correction off the parent alert.
+func (s *DispatchSuite) TestSARBadge_UsesFreshMetaAfterMidPassDispatchCorrection() {
+	slackMock, mlMock := new(mockSlackPoster), new(mockMLClient)
+	tc := s.newClientUnderTest(slackMock, mlMock)
+	tgid, meta := s.seedActiveRescue(tc)
+	s.Require().NoError(s.rdb.Set(s.ctx, fmt.Sprintf(summaryTSKeyFmt, tgid), "ts-sum", time.Hour).Err())
+
+	const corrected = "Rescue Trail TAC 10 Mailbox Peak"
+	mlMock.On("SummarizeRescue", mock.Anything, mock.Anything).Run(func(mock.Arguments) {
+		fresh := meta
+		fresh.Transcription = corrected
+		fresh.DispatchCorrection = &TranscriptCorrection{By: "U7", At: time.Now(), Original: meta.Transcription}
+		b, _ := json.Marshal(fresh)
+		s.Require().NoError(s.rdb.Set(s.ctx, fmt.Sprintf(tacMetaKeyFmt, tgid), string(b), time.Hour).Err())
+	}).Return(&ml.RescueSummary{Headline: "h", SARNotified: true}, nil).Once()
+
+	var alertBlocks string
+	slackMock.On("UpdateMessageContext", mock.Anything, "C-TEST", meta.MessageTS, mock.Anything).Run(func(args mock.Arguments) {
+		_, vals, err := slack.UnsafeApplyMsgOptions("", "C-TEST", "", args.Get(3).([]slack.MsgOption)...)
+		s.Require().NoError(err)
+		alertBlocks = vals.Get("blocks")
+	}).Return("", "", "", nil).Once()
+	slackMock.On("UpdateMessageContext", mock.Anything, "C-TEST", "ts-sum", mock.Anything).Return("", "", "", nil).Once()
+
+	s.True(tc.runOneSummaryPass(s.ctx, tgid, false))
+	slackMock.AssertExpectations(s.T())
+	s.Contains(alertBlocks, corrected, "parent alert must render the corrected dispatch text")
+	s.Contains(alertBlocks, "Corrected by", "parent alert must keep the correction label")
+	s.Contains(alertBlocks, "Rescue notified", "SAR badge still applied")
+}
+
+// Slack re-sends message_changed for link unfurls etc. with identical text: a no-op, not an edit.
+func (s *DispatchSuite) TestOperatorCorrections_UnchangedEdit_IsNoOp() {
+	tc := s.newClientUnderTest(new(mockSlackPoster), new(mockMLClient))
+	rec := &capturingRecorder{}
+	tc.recorder = rec
+	tgid, meta := s.seedActiveRescue(tc)
+
+	_, _, err := tc.UpsertOperatorCorrection(s.ctx, meta.ThreadTS, "ts-note", "U1", "diabetic", time.Now())
+	s.Require().NoError(err)
+	before, err := s.rdb.LRange(s.ctx, fmt.Sprintf(tacTranscriptsKeyFmt, tgid), 0, -1).Result()
+	s.Require().NoError(err)
+
+	got, created, err := tc.UpsertOperatorCorrection(s.ctx, meta.ThreadTS, "ts-note", "U2", "diabetic", time.Now())
+	s.ErrorIs(err, ErrOperatorCorrectionUnchanged)
+	s.Equal(tgid, got)
+	s.False(created)
+
+	after, err := s.rdb.LRange(s.ctx, fmt.Sprintf(tacTranscriptsKeyFmt, tgid), 0, -1).Result()
+	s.Require().NoError(err)
+	s.Equal(before, after, "entry untouched")
+	s.Len(rec.hc, 1, "no dataset row for an unchanged edit")
+
+	// A retracted note re-edited back to the same text is a real change (resurrection).
+	_, _, err = tc.RemoveOperatorCorrection(s.ctx, meta.ThreadTS, "ts-note", "U1")
+	s.Require().NoError(err)
+	_, _, err = tc.UpsertOperatorCorrection(s.ctx, meta.ThreadTS, "ts-note", "U1", "diabetic", time.Now())
+	s.NoError(err)
 }

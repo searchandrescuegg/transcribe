@@ -12,6 +12,8 @@ import (
 // CorrectionService is the transcribe-side API the controller drives for human corrections.
 // transcribe owns all state (entry schema, one-shot guard, summary refresh); the controller only
 // adapts Slack payloads to these calls. *transcribe.TranscribeClient implements it.
+// UpsertOperatorCorrection returns transcribe.ErrOperatorCorrectionUnchanged for an edit that
+// doesn't change a live note's text; the controller treats that as "do nothing".
 type CorrectionService interface {
 	ResolveCorrectionTarget(ctx context.Context, messageTS, threadTS string) (transcribe.CorrectionTarget, error)
 	ApplyTranscriptCorrection(ctx context.Context, target transcribe.CorrectionTarget, userID, newText string, now time.Time) error
@@ -27,6 +29,9 @@ var _ CorrectionService = (*transcribe.TranscribeClient)(nil)
 func correctionErrorMessage(err error) string {
 	var already *transcribe.AlreadyCorrectedError
 	switch {
+	case errors.As(err, &already) && already.Correction.By == "":
+		// The winner's correction couldn't be read back; don't render "<@> at 00:00".
+		return ":information_source: This message has already been corrected — only one correction is allowed per message."
 	case errors.As(err, &already):
 		return fmt.Sprintf(":information_source: Already corrected by <@%s> at %s — only one correction is allowed per message.",
 			already.Correction.By, already.Correction.At.Local().Format("15:04"))
