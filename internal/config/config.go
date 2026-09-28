@@ -101,6 +101,12 @@ type Config struct {
 	// worker context + the backend's own per-request timeout).
 	TACCleanupTimeout time.Duration `env:"TAC_CLEANUP_TIMEOUT" envDefault:"20s"`
 
+	// AudioAttachmentsEnabled uploads each transcription's WAV as a file reply in the rescue
+	// thread (TAC transmissions, the dispatch alert, re-page replies) so responders can listen to
+	// garbled audio. Best-effort; kill switch for thread noise or Slack upload limits. Requires
+	// the files:write bot scope.
+	AudioAttachmentsEnabled bool `env:"AUDIO_ATTACHMENTS_ENABLED" envDefault:"true"`
+
 	// Pulpo / PulsePoint CAD enrichment (optional). When PulpoEnabled is true the service queries
 	// the dispatch API for the units assigned to the active rescue and feeds that roster into the
 	// cleanup and summary prompts so garbled unit callsigns can be canonicalized. Entirely

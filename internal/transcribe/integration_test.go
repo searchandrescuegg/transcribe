@@ -48,6 +48,14 @@ func (m *mockSlackPoster) UpdateMessageContext(ctx context.Context, channelID, t
 	return args.String(0), args.String(1), args.String(2), args.Error(3)
 }
 
+func (m *mockSlackPoster) UploadFileV2Context(ctx context.Context, params slack.UploadFileV2Parameters) (*slack.FileSummary, error) {
+	args := m.Called(ctx, params)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*slack.FileSummary), args.Error(1)
+}
+
 type mockMLClient struct {
 	mock.Mock
 }
