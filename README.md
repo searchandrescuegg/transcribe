@@ -246,6 +246,28 @@ public URL, no signing-secret verification.
 Leaving `SLACK_APP_TOKEN` empty disables the buttons entirely — alerts ship without the
 actions row.
 
+6. **Human corrections** (allowlisted users only):
+   - **Correct transcript** — ⋯ menu → *Correct transcript* on the dispatch alert or any radio
+     transmission post. One correction per message; the post is relabelled
+     "✏️ Corrected by @you". The live interpretation is regenerated from the corrected text.
+   - **`correction:` replies** — a thread reply starting with `correction:` is treated as 100%
+     correct context by the live interpretation (✅ = applied). Editing or deleting the reply
+     updates/retracts it. Replies without the prefix are ignored.
+   Updating an existing app to this manifest adds scopes — reinstall and compare the Bot User
+   OAuth Token with `SLACK_TOKEN`, updating it if Slack issued a new one. This feature also
+   requires the bot to be a **member of the alert channel** (`/invite @transcribe`) — it needs
+   `message` events from that channel to see `correction:` replies, and `chat:write.public`
+   alone does not deliver those events.
+7. **Audio attachments** — each transcription's WAV is posted as a reply right under its post
+   (TAC transmissions, the dispatch alert, re-pages) so you can listen when the transcript looks
+   wrong. Needs the `files:write` scope (in the manifest) — reinstall the app, then compare
+   **OAuth & Permissions → Bot User OAuth Token** with `SLACK_TOKEN` and update it if Slack
+   issued a new one. Turn off with `AUDIO_ATTACHMENTS_ENABLED=false`. As in item 6, the bot must
+   be a **member of the alert channel** (`/invite @transcribe`) for uploads to share into threads.
+   Until the app is reinstalled with `files:write`, each transmission logs
+   `WARN audio attachment failed` (`missing_scope`) — harmless, the transcript still posts. Audio
+   files are kept in Slack file storage under the workspace's retention policy.
+
 #### Live interpretation
 
 Every transmission appends to `tac_transcripts:<TGID>` and triggers a structured

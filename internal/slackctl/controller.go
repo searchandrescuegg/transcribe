@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 
 	"github.com/searchandrescuegg/transcribe/internal/config"
 	"github.com/searchandrescuegg/transcribe/internal/dragonfly"
@@ -39,11 +40,19 @@ type Controller struct {
 	// leadership gate entirely — operators choosing this should know what they're trading
 	// off (lost audit-trail-as-authz, fat-finger surface area).
 	allowAny bool
+
+	// corrections drives human transcript corrections and `correction:` notes. Nil disables
+	// them (tests that only exercise cancel/extend/switch construct the controller without it).
+	corrections CorrectionService
+
+	// correctionOpLocks serializes `correction:` note operations per Slack message (striped by
+	// a hash of the message ts; see handleCorrectionOp). Zero value is ready to use.
+	correctionOpLocks [correctionOpLockStripes]sync.Mutex
 }
 
 // New constructs the controller. Returns ErrSocketModeDisabled if SLACK_APP_TOKEN is
 // empty so callers can no-op gracefully when the feature isn't configured.
-func New(cfg *config.Config, dfly *dragonfly.DragonflyClient) (*Controller, error) {
+func New(cfg *config.Config, dfly *dragonfly.DragonflyClient, corrections CorrectionService) (*Controller, error) {
 	if cfg.SlackAppToken == "" {
 		return nil, ErrSocketModeDisabled
 	}
@@ -91,6 +100,7 @@ func New(cfg *config.Config, dfly *dragonfly.DragonflyClient) (*Controller, erro
 		cfg:         cfg,
 		allowed:     allowed,
 		allowAny:    allowAny,
+		corrections: corrections,
 	}, nil
 }
 
@@ -99,6 +109,8 @@ func New(cfg *config.Config, dfly *dragonfly.DragonflyClient) (*Controller, erro
 func (c *Controller) Run(ctx context.Context) error {
 	handler := socketmode.NewSocketmodeHandler(c.smClient)
 	handler.Handle(socketmode.EventTypeInteractive, c.dispatch)
+	// Events API: `message` events carry `correction:` thread replies (see operator_corrections.go).
+	handler.Handle(socketmode.EventTypeEventsAPI, c.dispatchEvent)
 	slog.Info("slackctl: starting Socket Mode controller", slog.Int("authorized_users", len(c.allowed)))
 	if err := handler.RunEventLoopContext(ctx); err != nil {
 		return fmt.Errorf("socketmode event loop: %w", err)
@@ -106,23 +118,44 @@ func (c *Controller) Run(ctx context.Context) error {
 	return nil
 }
 
-// dispatch fans block_actions out to the typed handlers. Other interactivity types
-// (modal submits, view closes, etc.) are ack'd and ignored.
+// dispatch fans block_actions and message shortcuts out to the typed handlers. The one
+// exception to blanket-acking is the correction modal's view_submission, which is handed to
+// handleCorrectionSubmission so it can ack WITH a payload (inline validation errors). Other
+// interactivity types (other modal submits, view closes, etc.) are ack'd and ignored.
 func (c *Controller) dispatch(evt *socketmode.Event, client *socketmode.Client) {
+	payload, ok := evt.Data.(slack.InteractionCallback)
+	if !ok {
+		if evt.Request != nil {
+			client.Ack(*evt.Request)
+		}
+		slog.Warn("slackctl: dropping non-interactive event", slog.String("type", string(evt.Type)))
+		return
+	}
+
+	// The correction modal's submission must be acked WITH a payload (inline validation errors),
+	// so it is the one interaction that isn't blanket-acked here.
+	if payload.Type == slack.InteractionTypeViewSubmission && payload.View.CallbackID == CallbackIDCorrectionModal && evt.Request != nil {
+		c.handleCorrectionSubmission(evt, client, payload)
+		return
+	}
+
 	// Always ack the request promptly so Slack doesn't retry. The handlers below run
-	// asynchronously relative to the ack and surface errors via Slack messages, not via
-	// the Socket Mode response.
+	// asynchronously relative to the ack and surface errors via Slack messages.
 	if evt.Request != nil {
 		client.Ack(*evt.Request)
 	}
 
-	payload, ok := evt.Data.(slack.InteractionCallback)
-	if !ok {
-		slog.Warn("slackctl: dropping non-interactive event", slog.String("type", string(evt.Type)))
+	if payload.Type == slack.InteractionTypeMessageAction && payload.CallbackID == CallbackIDCorrectTranscript {
+		if !c.isAuthorized(payload.User.ID) {
+			c.respondNotAuthorized(payload)
+			return
+		}
+		c.handleCorrectShortcut(context.Background(), payload)
 		return
 	}
+
 	if payload.Type != slack.InteractionTypeBlockActions {
-		// Modals, shortcuts, etc. — not in scope for this feature.
+		// Other modals, shortcuts, etc. — not in scope.
 		return
 	}
 

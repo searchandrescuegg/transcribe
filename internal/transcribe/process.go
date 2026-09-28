@@ -84,7 +84,7 @@ func selectTrailRescueMessage(dispatchMessages *ml.DispatchMessages, transcripti
 	return nil, ""
 }
 
-func (tc *TranscribeClient) processDispatchCall(ctx context.Context, parsedKey *AdornedDeconstructedKey, tr *asr.TranscriptionResponse) error {
+func (tc *TranscribeClient) processDispatchCall(ctx context.Context, parsedKey *AdornedDeconstructedKey, tr *asr.TranscriptionResponse, audio []byte) error {
 	slog.Debug("processing fire dispatch transcription", slog.String("talkgroup", parsedKey.dk.Talkgroup), slog.String("transcription", tr.Transcription))
 
 	// FIX (review item #3): pass ctx through so worker timeout / shutdown actually cancels the LLM call.
@@ -114,7 +114,7 @@ func (tc *TranscribeClient) processDispatchCall(ctx context.Context, parsedKey *
 	// away from the original thread and orphaning it (with no safe way to act on the old alert).
 	// Instead, refresh the activation window and note the re-page in the existing thread.
 	if meta, active := tc.readClosureMeta(ctx, tg.TGID); active {
-		return tc.handleAdditionalDispatch(ctx, parsedKey, tr, meta)
+		return tc.handleAdditionalDispatch(ctx, parsedKey, tr, meta, audio)
 	}
 
 	err = tc.dragonflyClient.SAddEx(ctx, "allowed_talkgroups", tc.config.TacticalChannelActivationDuration, tg.TGID)
@@ -161,6 +161,7 @@ func (tc *TranscribeClient) processDispatchCall(ctx context.Context, parsedKey *
 		SourceTalkgroup: parsedKey.dk.Talkgroup,
 		MessageTS:       tsThread, // alert is the thread parent; ts == thread_ts for chat.update later
 		Transcription:   tr.Transcription,
+		DispatchS3Key:   parsedKey.key,
 	}, expiresAt); err != nil {
 		slog.Error("failed to persist TAC closure schedule", slog.String("error", err.Error()), slog.String("tac_channel", dispatchMessage.TACChannel))
 	}
@@ -169,9 +170,15 @@ func (tc *TranscribeClient) processDispatchCall(ctx context.Context, parsedKey *
 	// disabled). Resolving here — right after we know the incident is a trail rescue — means the
 	// first TAC transmission already has a unit roster to canonicalize against, and the dispatch
 	// capture time anchors incident-recency scoring. Failures are swallowed inside the helper.
+	// Runs BEFORE the audio upload: the warm-up serves monitoring, the upload is cosmetic.
 	if tc.unitResolver != nil {
 		tc.resolveAndCacheUnitContext(ctx, tg.TGID, tr.Transcription, parsedKey.dk.Time)
 	}
+
+	// Attach the dispatch audio as the first reply in the alert thread. Last, only after the
+	// rescue is fully registered (allow-list, routing, closure, CAD warm-up), so a slow/failed
+	// upload can never delay or block monitoring. Best-effort.
+	tc.attachAudio(ctx, tsThread, parsedKey.key, audioTitle(dispatchChannelName(), parsedKey.dk.Time), audio)
 
 	return nil
 }
@@ -183,7 +190,7 @@ func (tc *TranscribeClient) processDispatchCall(ctx context.Context, parsedKey *
 // incident. Best-effort throughout — the per-S3-key dedup guard means this audio won't be
 // reprocessed on redelivery, so we swallow errors (logging them) and ack rather than risk losing
 // the re-page entirely or double-posting the reply.
-func (tc *TranscribeClient) handleAdditionalDispatch(ctx context.Context, parsedKey *AdornedDeconstructedKey, tr *asr.TranscriptionResponse, meta ClosureMeta) error {
+func (tc *TranscribeClient) handleAdditionalDispatch(ctx context.Context, parsedKey *AdornedDeconstructedKey, tr *asr.TranscriptionResponse, meta ClosureMeta, audio []byte) error {
 	slog.Info("additional dispatch for an active rescue; deduping (no new alert)",
 		slog.String("tgid", meta.TGID), slog.String("tac_channel", meta.TACChannel), slog.String("thread", meta.ThreadTS))
 
@@ -198,6 +205,11 @@ func (tc *TranscribeClient) handleAdditionalDispatch(ctx context.Context, parsed
 	}
 	// Reuse the ORIGINAL meta (thread_ts, message_ts, dispatch transcript) with the new expiry so
 	// the auto-close pushes out and the feedback prefill still reflects the initiating dispatch.
+	// Re-read right before writing: a dispatch correction may have landed since the caller read
+	// meta, and ScheduleTACClosure rewrites the whole JSON. Narrows (does not eliminate) the race.
+	if fresh, ok := tc.readClosureMeta(ctx, meta.TGID); ok {
+		meta = fresh
+	}
 	if err := tc.ScheduleTACClosure(ctx, meta, expiresAt); err != nil {
 		slog.Error("additional dispatch: failed to reschedule closure", slog.String("error", err.Error()), slog.String("tgid", meta.TGID))
 	}
@@ -210,10 +222,12 @@ func (tc *TranscribeClient) handleAdditionalDispatch(ctx context.Context, parsed
 	); err != nil {
 		slog.Error("additional dispatch: failed to post thread reply", slog.String("error", err.Error()), slog.String("tgid", meta.TGID))
 	}
+
+	tc.attachAudio(ctx, meta.ThreadTS, parsedKey.key, audioTitle(dispatchChannelName(), parsedKey.dk.Time), audio)
 	return nil
 }
 
-func (tc *TranscribeClient) processNonDispatchCall(ctx context.Context, parsedKey *AdornedDeconstructedKey, tr *asr.TranscriptionResponse) error {
+func (tc *TranscribeClient) processNonDispatchCall(ctx context.Context, parsedKey *AdornedDeconstructedKey, tr *asr.TranscriptionResponse, audio []byte) error {
 	slog.Debug("call is not a fire dispatch", slog.String("talkgroup", parsedKey.dk.Talkgroup), slog.String("transcription", tr.Transcription))
 
 	// get slack thread ID from Dragonfly
@@ -240,28 +254,53 @@ func (tc *TranscribeClient) processNonDispatchCall(ctx context.Context, parsedKe
 	// back to the raw transcription so the transmission is never dropped.
 	cleaned := tc.maybeCleanTranscript(ctx, parsedKey.dk.Talkgroup, tr.Transcription)
 
-	// FIX (review item #1): sendSlackWithRetry actually retries on rate limit; the prior path
-	// waited and discarded the message. Errors now propagate so Work() can Nack for redelivery.
-	if _, err := tc.sendSlackWithRetry(ctx, parsedKey.dk.Talkgroup,
+	// postedAt is rendered on the post and stored so a later human correction can re-render the
+	// identical block with the corrected text.
+	postedAt := time.Now().Local()
+	postTS, err := tc.sendSlackWithRetry(ctx, parsedKey.dk.Talkgroup,
 		slack.MsgOptionBlocks(BuildThreadCommunicationBlocks(&ThreadCommunicationBlocksInput{
 			Channel: tgInfo.FullName,
 			Message: cleaned,
-			TS:      time.Now().Local(),
+			TS:      postedAt,
 		})...),
 		slack.MsgOptionAsUser(true),
 		slack.MsgOptionTS(tsThread),
-	); err != nil {
+	)
+	if err != nil {
 		return fmt.Errorf("%w: %s", ErrFailedToPostSlackMessage, err.Error())
 	}
 
 	slog.Debug("posted transcription message to Slack", slog.String("talkgroup", parsedKey.dk.Talkgroup), slog.String("thread_id", tsThread))
 
-	// Roll the rescue's live interpretation forward with the CLEANED text. Best-effort and
-	// decoupled — if the LLM call or chat.update fails we still consider the TAC transmission
-	// processed (the per-message thread reply above is the canonical record). Uses
-	// parsedKey.dk.Time as the capture moment so the model sees stable timestamps even when
-	// pipeline latency varies between transmissions.
-	tc.updateLiveInterpretation(ctx, parsedKey.dk.Talkgroup, parsedKey.dk.Time, cleaned)
+	// Store the transmission FIRST, then upload audio, then refresh the summary. The entry is
+	// built with the CLEANED text plus the post ts and S3 key so the "Correct transcript" shortcut
+	// can find and amend this exact entry later. Storing before the upload means a slow upload
+	// that burns the worker budget can never keep the transmission out of tac_transcripts (it
+	// would otherwise be missing from every later summary and uncorrectable).
+	entry := liveTranscriptEntry{
+		CapturedAt: parsedKey.dk.Time.Format("15:04:05"),
+		Text:       cleaned,
+		Kind:       entryKindRadio,
+		PostedAt:   postedAt.Format(time.RFC3339),
+		SlackTS:    postTS,
+		S3Key:      parsedKey.key,
+	}
+	stored := false
+	if entry.Text != "" {
+		if err := tc.appendEntry(ctx, parsedKey.dk.Talkgroup, entry); err != nil {
+			slog.Warn("live interpretation: append failed", slog.String("error", err.Error()), slog.String("tgid", parsedKey.dk.Talkgroup))
+		} else {
+			stored = true
+		}
+	}
+
+	// Audio right under its transcript, before the (slow) summary refresh. Best-effort; skipped
+	// when too little worker budget remains for the summary (see attachAudio).
+	tc.attachAudio(ctx, tsThread, parsedKey.key, audioTitle(tgInfo.FullName, parsedKey.dk.Time), audio)
+
+	if stored {
+		tc.RefreshLiveInterpretation(ctx, parsedKey.dk.Talkgroup, false)
+	}
 	return nil
 }
 
@@ -284,15 +323,22 @@ func (tc *TranscribeClient) maybeCleanTranscript(ctx context.Context, tgid, raw 
 		defer cancel()
 	}
 
-	var dispatchText string
+	// Two dispatch texts on purpose. After a dispatch correction, meta.Transcription is
+	// human-typed: it is the better key for CAD/unit correlation, but human input must NEVER
+	// reach CleanTACTranscript (cleanup is phonetic-only and must fail safe — it may not borrow
+	// words a human typed), so the cleanup context stays the original ASR text.
+	var dispatchText, cleanupContext string
 	if meta, ok := tc.readClosureMeta(cleanCtx, tgid); ok {
-		dispatchText = meta.Transcription
+		dispatchText, cleanupContext = meta.Transcription, meta.Transcription
+		if meta.DispatchCorrection != nil {
+			cleanupContext = meta.DispatchCorrection.Original
+		}
 	}
 	unitContext := tc.unitContextFor(cleanCtx, tgid, dispatchText, time.Now())
 
 	res, err := tc.mlClient.CleanTACTranscript(cleanCtx, ml.TACCleanupInput{
 		Text:            raw,
-		DispatchContext: dispatchText,
+		DispatchContext: cleanupContext,
 		UnitContext:     unitContext,
 	})
 	if err != nil {
@@ -303,4 +349,12 @@ func (tc *TranscribeClient) maybeCleanTranscript(ctx context.Context, tgid, raw 
 		return raw
 	}
 	return res.CleanedText
+}
+
+// dispatchChannelName is the display name used to title Fire Dispatch 1 audio replies.
+func dispatchChannelName() string {
+	if tg, ok := talkgroupFromTGID[FireDispatch1TGID]; ok {
+		return tg.FullName
+	}
+	return "Fire Dispatch 1"
 }

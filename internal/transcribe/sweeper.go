@@ -46,6 +46,12 @@ type ClosureMeta struct {
 	// Stored so the sweeper can rebuild the alert blocks (preserving the transcript)
 	// when the auto-close fires and we need to remove the action buttons.
 	Transcription string `json:"transcription,omitempty"`
+	// DispatchCorrection is set when leadership corrected the dispatch transcription via the
+	// "Correct transcript" shortcut. Transcription then holds the corrected text; Original keeps
+	// what the ASR produced. Rendered as the "Corrected by" label on the alert.
+	DispatchCorrection *TranscriptCorrection `json:"dispatch_correction,omitempty"`
+	// DispatchS3Key is the audio object that produced the alert, for dataset joins.
+	DispatchS3Key string `json:"dispatch_s3_key,omitempty"`
 }
 
 // ScheduleTACClosure persists a pending channel-closed notification keyed by expiry time.
@@ -196,6 +202,7 @@ func (tc *TranscribeClient) updateAlertForClosure(ctx context.Context, m *Closur
 	// is not configured.
 	feedbackURL := tc.buildFeedbackURL(ctx, m.TGID, *m, closedAt)
 
+	summary, _ := tc.readSummaryData(ctx, m.TGID)
 	blocks := BuildRescueTrailBlocks(&RescueTrailBlocksInput{
 		TACChannel:        m.TACChannel,
 		TranscriptionText: m.Transcription,
@@ -204,8 +211,10 @@ func (tc *TranscribeClient) updateAlertForClosure(ctx context.Context, m *Closur
 		TACTalkgroupTGID: m.TGID,
 		ClosedAt:         &closedAt,
 		FeedbackURL:      feedbackURL,
-		// Preserve the SAR-notified badge on the closed alert if it was set during the rescue.
-		SARNotified: tc.summarySARNotified(ctx, m.TGID),
+		// Preserve the SAR badge and the final brief on the closed alert.
+		SARNotified: summary != nil && summary.SARNotified,
+		Brief:       FormatBrief(summary),
+		Correction:  m.DispatchCorrection,
 	})
 
 	updateCtx, cancel := context.WithTimeout(ctx, tc.config.SlackTimeout)
@@ -238,12 +247,4 @@ func (tc *TranscribeClient) readSummaryData(ctx context.Context, tgid string) (*
 		return nil, false
 	}
 	return &s, true
-}
-
-// summarySARNotified reads the latest cached RescueSummary and reports whether SAR was
-// notified, so the green-check badge survives onto the closed alert. Best-effort — any read
-// or decode failure defaults to false (no badge).
-func (tc *TranscribeClient) summarySARNotified(ctx context.Context, tgid string) bool {
-	s, ok := tc.readSummaryData(ctx, tgid)
-	return ok && s.SARNotified
 }

@@ -35,11 +35,13 @@ func (f *fakeInner) CleanTACTranscript(context.Context, ml.TACCleanupInput) (*ml
 
 type fakeRecorder struct {
 	llm []LLMInteractionRecord
+	hc  []HumanCorrectionRecord
 }
 
-func (r *fakeRecorder) RecordTranscription(TranscriptionRecord)     {}
-func (r *fakeRecorder) RecordLLMInteraction(l LLMInteractionRecord) { r.llm = append(r.llm, l) }
-func (r *fakeRecorder) Close() error                                { return nil }
+func (r *fakeRecorder) RecordTranscription(TranscriptionRecord)       {}
+func (r *fakeRecorder) RecordLLMInteraction(l LLMInteractionRecord)   { r.llm = append(r.llm, l) }
+func (r *fakeRecorder) RecordHumanCorrection(h HumanCorrectionRecord) { r.hc = append(r.hc, h) }
+func (r *fakeRecorder) Close() error                                  { return nil }
 
 func TestRecordingMLClient_DispatchSuccess_RecordsAndPassesThrough(t *testing.T) {
 	inner := &fakeInner{dispatchOut: &ml.DispatchMessages{Transcription: "cleaned"}}
@@ -132,3 +134,15 @@ func TestPingWithBackoff_RespectsCanceledContext(t *testing.T) {
 	require.Error(t, err, "unreachable DB with a cancelled ctx must return an error")
 	assert.Less(t, elapsed, 5*time.Second, "must give up promptly on cancelled ctx, not retry for pingMaxElapsedTime")
 }
+
+// The embedded migrations must include the human_corrections table so a fresh DB gets it.
+func TestMigrations_IncludeHumanCorrections(t *testing.T) {
+	b, err := embedMigrations.ReadFile("migrations/00002_human_corrections.sql")
+	require.NoError(t, err)
+	assert.Contains(t, string(b), "CREATE TABLE IF NOT EXISTS human_corrections")
+	assert.Contains(t, string(b), "-- +goose Down")
+}
+
+// Store must satisfy the widened Recorder interface (compile-time check lives in store.go);
+// the fake used by other tests must too.
+var _ Recorder = (*fakeRecorder)(nil)

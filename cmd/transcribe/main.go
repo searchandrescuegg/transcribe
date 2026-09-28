@@ -296,7 +296,7 @@ func main() {
 	// Slack interactivity controller (Cancel / Extend buttons). Optional: when SLACK_APP_TOKEN
 	// is unset the feature is silently disabled. When set, the controller opens an outbound
 	// Socket Mode WebSocket to Slack — no public HTTP endpoint required.
-	slackController, err := slackctl.New(c, dragonflyClient)
+	slackController, err := slackctl.New(c, dragonflyClient, transcribeClient)
 	switch {
 	case errors.Is(err, slackctl.ErrSocketModeDisabled):
 		slog.Info("Slack interactivity disabled (SLACK_APP_TOKEN not set)")

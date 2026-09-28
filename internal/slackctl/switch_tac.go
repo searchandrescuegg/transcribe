@@ -65,6 +65,11 @@ func (c *Controller) SwitchTAC(ctx context.Context, oldTGID, newTGID string) (ne
 		ThreadTS:        oldMeta.ThreadTS,
 		SourceTalkgroup: oldMeta.SourceTalkgroup,
 		MessageTS:       oldMeta.MessageTS,
+		// Same incident → carry the dispatch transcript (and any human correction of it). Dropping
+		// these used to blank the summary/cleanup context and the closed-alert rebuild after a switch.
+		Transcription:      oldMeta.Transcription,
+		DispatchCorrection: oldMeta.DispatchCorrection,
+		DispatchS3Key:      oldMeta.DispatchS3Key,
 	}
 
 	// Order: write new state BEFORE removing old. This means a reader observing mid-flight
@@ -90,6 +95,16 @@ func (c *Controller) SwitchTAC(ctx context.Context, oldTGID, newTGID string) (ne
 	if _, err := c.dfly.ZRem(ctx, activeTACsKey, oldTGID); err != nil {
 		return transcribe.ClosureMeta{}, time.Time{}, false, fmt.Errorf("ZRem old closure: %w", err)
 	}
+
+	// Human-verified `correction:` notes describe the same incident; carry them to the new TGID
+	// before the old list is deleted. Best-effort: a failure logs but never blocks the switch.
+	if c.corrections != nil {
+		if err := c.corrections.MigrateOperatorCorrections(ctx, oldTGID, newTGID); err != nil {
+			slog.Warn("slackctl: failed to migrate operator corrections on switch",
+				slog.String("error", err.Error()), slog.String("old_tgid", oldTGID), slog.String("new_tgid", newTGID))
+		}
+	}
+
 	if err := c.dfly.Del(ctx,
 		fmt.Sprintf(tacMetaKeyFmt, oldTGID),
 		fmt.Sprintf(tacTranscriptsKeyFmt, oldTGID),
@@ -198,7 +213,6 @@ func (c *Controller) handleSwitchTAC(ctx context.Context, payload slack.Interact
 		slog.Error("slackctl: failed to post switch thread reply", slog.String("error", err.Error()))
 	}
 
-	// Note: we deliberately don't chat.update the original alert — rebuilding its blocks
-	// would need the original transcription text which we don't persist in metadata. The
-	// thread reply is the canonical record of the correction.
+	// Note: we deliberately don't chat.update the original alert; the thread reply is the
+	// canonical record of the switch.
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/searchandrescuegg/transcribe/internal/ml"
@@ -49,130 +50,118 @@ const (
 	// We tie this to OPENAI_TIMEOUT-equivalent semantics: the holder either finishes within
 	// this window or its lock expires and another worker can pick up.
 	summaryLockTTL = 150 * time.Second
-	// summaryStaleTTL is short on purpose: the flag is meaningful only for the brief window
-	// between RPush-during-lock and the lock holder's next stale-check. Beyond that the
-	// next transmission will retrigger the path naturally.
-	summaryStaleTTL = 60 * time.Second
+	// summaryStaleTTL must outlive the longest summary pass. The flag is set by a lock loser
+	// while the holder's pass is in flight and read only after that pass finishes; if it
+	// expired sooner (a summary LLM call can take up to ~120s), a pending "rewrite" — or a
+	// plain rerun — would silently vanish before the holder consumed it. Tying it to the lock
+	// TTL guarantees the flag survives any pass the lock itself can cover.
+	summaryStaleTTL = summaryLockTTL
+
+	// summary_stale values. "1" = a transmission arrived during the last pass, rerun additively.
+	// "rewrite" = an edit/retraction arrived, rerun WITHOUT the previous summary. A pending
+	// "rewrite" is never downgraded: plain losers use SETNX, rewrite losers use SET.
+	staleValueRerun   = "1"
+	staleValueRewrite = "rewrite"
 )
 
-// liveTranscriptEntry is the per-RPush record. Capture time is what the model wires into
-// KeyEvents — pulled from the audio's filename timestamp, not when the transcription
-// finished (which would jitter with pipeline latency).
-type liveTranscriptEntry struct {
-	CapturedAt string `json:"captured_at"`
-	Text       string `json:"text"`
+// updateLiveInterpretation appends one radio transcript and refreshes the running summary.
+// Kept for callers/tests that only have text; processNonDispatchCall calls appendEntry and
+// RefreshLiveInterpretation directly so it can record the Slack post ts and S3 key and upload
+// audio between the two.
+func (tc *TranscribeClient) updateLiveInterpretation(ctx context.Context, tacTGID string, capturedAt time.Time, transcript string) {
+	tc.appendAndRefresh(ctx, tacTGID, liveTranscriptEntry{
+		CapturedAt: capturedAt.Format("15:04:05"),
+		Text:       transcript,
+		Kind:       entryKindRadio,
+	})
 }
 
-// updateLiveInterpretation appends one TAC transcript and refreshes the rescue thread's
-// running summary. Best-effort: any failure logs and continues so the worker still acks the
-// underlying Pulsar message — the canonical record of what was said is the per-transmission
-// thread reply that processNonDispatchCall already posted.
+// appendAndRefresh records one entry (lossless — every worker appends) then runs an additive
+// summary refresh. Best-effort: failures log and return.
+func (tc *TranscribeClient) appendAndRefresh(ctx context.Context, tgid string, e liveTranscriptEntry) {
+	if e.Text == "" {
+		return
+	}
+	if err := tc.appendEntry(ctx, tgid, e); err != nil {
+		slog.Warn("live interpretation: append failed", slog.String("error", err.Error()), slog.String("tgid", tgid))
+		return
+	}
+	tc.RefreshLiveInterpretation(ctx, tgid, false)
+}
+
+// RefreshLiveInterpretation re-summarizes the rescue and posts/updates the Live Interpretation.
+// rewrite=true runs the first pass without the previous summary (used after a human edit or
+// retraction so facts derived from superseded text are re-derived).
 //
-// Concurrency model: when N transmissions arrive nearly simultaneously (synthetic trigger
-// burst, real-world heavy traffic), each worker:
-//  1. RPushes its transcript (everyone records, lossless).
-//  2. Tries to SetNX a per-TGID summary lock. Loser sets a stale flag and returns immediately
-//     — no LLM call, no Slack post.
-//  3. Winner runs the summarize-and-post loop, which re-summarizes whenever the stale flag
-//     was set during the last cycle. Net cost: ~2 LLM calls per burst regardless of N.
-func (tc *TranscribeClient) updateLiveInterpretation(ctx context.Context, tacTGID string, capturedAt time.Time, transcript string) {
-	if transcript == "" {
-		return
-	}
+// Concurrency model (unchanged from the original burst design): a per-TGID SETNX lock admits one
+// holder; losers leave a signal in summary_stale and return. The holder loops, consuming the
+// signal with GETDEL before each pass so a "rewrite" that lands mid-pass is never lost.
+func (tc *TranscribeClient) RefreshLiveInterpretation(ctx context.Context, tgid string, rewrite bool) {
+	lockKey := fmt.Sprintf(summaryLockKeyFmt, tgid)
+	staleKey := fmt.Sprintf(summaryStaleKeyFmt, tgid)
 
-	listKey := fmt.Sprintf(tacTranscriptsKeyFmt, tacTGID)
-	listTTL := 2 * tc.config.TacticalChannelActivationDuration
-	if err := tc.appendTranscript(ctx, listKey, listTTL, capturedAt, transcript); err != nil {
-		slog.Warn("live interpretation: append failed", slog.String("error", err.Error()), slog.String("tgid", tacTGID))
-		return
-	}
-
-	// Try to take ownership of the LLM-and-post cycle. Losers mark the rescue stale and
-	// return — the existing lock holder will pick up our transcript on its next pass.
-	lockKey := fmt.Sprintf(summaryLockKeyFmt, tacTGID)
 	acquired, err := tc.dragonflyClient.SetNX(ctx, lockKey, summaryLockTTL, "1")
 	if err != nil {
-		slog.Warn("live interpretation: lock SetNX failed; skipping summary update", slog.String("error", err.Error()), slog.String("tgid", tacTGID))
+		slog.Warn("live interpretation: lock SetNX failed; skipping summary update", slog.String("error", err.Error()), slog.String("tgid", tgid))
 		return
 	}
 	if !acquired {
-		// Another worker is mid-summary. Mark stale so it knows to re-summarize when it
-		// finishes — guarantees our transcript ends up reflected in the displayed summary.
-		if err := tc.dragonflyClient.Set(ctx, fmt.Sprintf(summaryStaleKeyFmt, tacTGID), summaryStaleTTL, "1"); err != nil {
-			slog.Warn("live interpretation: failed to set stale flag", slog.String("error", err.Error()), slog.String("tgid", tacTGID))
-		}
+		tc.markSummaryStale(ctx, staleKey, rewrite, tgid)
 		return
 	}
 	defer func() {
 		if err := tc.dragonflyClient.Del(ctx, lockKey); err != nil {
-			slog.Warn("live interpretation: failed to release summary lock; will expire via TTL", slog.String("error", err.Error()), slog.String("tgid", tacTGID))
+			slog.Warn("live interpretation: failed to release summary lock; will expire via TTL", slog.String("error", err.Error()), slog.String("tgid", tgid))
 		}
 	}()
 
-	// Loop: each pass clears the stale flag, re-reads the full transcripts list, summarizes,
-	// and posts/updates Slack. If the stale flag got set during the work (another worker
-	// arrived), we go around again. Hard-cap iterations as belt-and-suspenders against any
-	// pathological loop where the flag is being toggled forever.
 	const maxIterations = 5
 	for i := 0; i < maxIterations; i++ {
-		if err := tc.dragonflyClient.Del(ctx, fmt.Sprintf(summaryStaleKeyFmt, tacTGID)); err != nil {
-			// Failure to clear isn't fatal — worst case we run an extra summarize.
-			slog.Warn("live interpretation: failed to clear stale flag", slog.String("error", err.Error()))
+		pending, err := tc.dragonflyClient.GetDel(ctx, staleKey)
+		if err != nil {
+			slog.Warn("live interpretation: failed to consume stale flag", slog.String("error", err.Error()))
 		}
-		if !tc.runOneSummaryPass(ctx, tacTGID, listKey, listTTL) {
-			// Pass returned false: rescue isn't live (no metadata) or unrecoverable error.
+		if pending == staleValueRewrite {
+			rewrite = true
+		}
+		if !tc.runOneSummaryPass(ctx, tgid, rewrite) {
 			return
 		}
-		stale, err := tc.dragonflyClient.Get(ctx, fmt.Sprintf(summaryStaleKeyFmt, tacTGID))
+		next, err := tc.dragonflyClient.Get(ctx, staleKey)
 		if err != nil {
 			slog.Warn("live interpretation: failed to read stale flag; assuming caught up", slog.String("error", err.Error()))
 			return
 		}
-		if stale != "1" {
-			return // No new transcripts arrived during our work — we're caught up.
+		if next == "" {
+			return
 		}
-		slog.Debug("live interpretation: stale flag set during summary; re-running", slog.String("tgid", tacTGID), slog.Int("iteration", i+1))
+		rewrite = false // the next iteration's GETDEL re-derives it from the pending value
+		slog.Debug("live interpretation: stale flag set during summary; re-running", slog.String("tgid", tgid), slog.Int("iteration", i+1))
 	}
-	slog.Warn("live interpretation: hit maxIterations; giving up to avoid infinite loop", slog.String("tgid", tacTGID))
+	slog.Warn("live interpretation: hit maxIterations; giving up to avoid infinite loop", slog.String("tgid", tgid))
 }
 
-// appendTranscript handles the RPush + Expire pair so the caller stays focused on the
-// concurrency policy. Re-stamps the TTL on every push so an active rescue's transcripts
-// list never expires under the rescue's feet.
-func (tc *TranscribeClient) appendTranscript(ctx context.Context, listKey string, listTTL time.Duration, capturedAt time.Time, transcript string) error {
-	encoded, err := json.Marshal(liveTranscriptEntry{
-		CapturedAt: capturedAt.Format("15:04:05"),
-		Text:       transcript,
-	})
+func (tc *TranscribeClient) markSummaryStale(ctx context.Context, staleKey string, rewrite bool, tgid string) {
+	var err error
+	if rewrite {
+		err = tc.dragonflyClient.Set(ctx, staleKey, summaryStaleTTL, staleValueRewrite)
+	} else {
+		// SETNX so a pending "rewrite" is never downgraded to a plain rerun.
+		_, err = tc.dragonflyClient.SetNX(ctx, staleKey, summaryStaleTTL, staleValueRerun)
+	}
 	if err != nil {
-		return fmt.Errorf("marshal transcript entry: %w", err)
+		slog.Warn("live interpretation: failed to set stale flag", slog.String("error", err.Error()), slog.String("tgid", tgid))
 	}
-	if err := tc.dragonflyClient.RPush(ctx, listKey, string(encoded)); err != nil {
-		return fmt.Errorf("RPush: %w", err)
-	}
-	if err := tc.dragonflyClient.Expire(ctx, listKey, listTTL); err != nil {
-		return fmt.Errorf("expire: %w", err)
-	}
-	return nil
 }
 
 // runOneSummaryPass reads the full transcripts list, calls SummarizeRescue, and posts (or
 // chat.update's) the running interpretation message. Returns false on terminal failures
 // (no metadata, ML unrecoverable error) so the caller stops iterating.
-func (tc *TranscribeClient) runOneSummaryPass(ctx context.Context, tacTGID, listKey string, listTTL time.Duration) bool {
-	rawEntries, err := tc.dragonflyClient.LRange(ctx, listKey, 0, -1)
+func (tc *TranscribeClient) runOneSummaryPass(ctx context.Context, tacTGID string, rewrite bool) bool {
+	entries, err := tc.readEntries(ctx, tacTGID)
 	if err != nil {
 		slog.Warn("live interpretation: LRange failed", slog.String("error", err.Error()), slog.String("tgid", tacTGID))
 		return false
-	}
-	transcripts := make([]ml.TACTranscript, 0, len(rawEntries))
-	for _, raw := range rawEntries {
-		var e liveTranscriptEntry
-		if err := json.Unmarshal([]byte(raw), &e); err != nil {
-			slog.Warn("live interpretation: dropping unparseable transcript entry", slog.String("error", err.Error()))
-			continue
-		}
-		transcripts = append(transcripts, ml.TACTranscript{CapturedAt: e.CapturedAt, Text: e.Text})
 	}
 
 	meta, ok := tc.readClosureMeta(ctx, tacTGID)
@@ -180,22 +169,15 @@ func (tc *TranscribeClient) runOneSummaryPass(ctx context.Context, tacTGID, list
 		return false
 	}
 
-	// Additive context: feed the model its own PREVIOUS summary (if any) so it extends the
-	// established record rather than re-deriving it — this is what stops key events from churning
-	// between transmissions. A missing/unparseable prior summary simply degrades to a fresh
-	// (full-rewrite) pass. Also feed the CAD unit roster (empty when enrichment is off) so garbled
-	// callsigns can be canonicalized.
-	previousSummary, _ := tc.readSummaryData(ctx, tacTGID)
+	// Additive context (see rule 12) unless this pass is a rewrite after a human edit/retraction.
+	var previousSummary *ml.RescueSummary
+	if !rewrite {
+		previousSummary, _ = tc.readSummaryData(ctx, tacTGID)
+	}
 	unitContext := tc.unitContextFor(ctx, tacTGID, meta.Transcription, time.Now())
+	input := buildSummaryInput(meta, entries, previousSummary, unitContext)
 
-	summary, err := tc.mlClient.SummarizeRescue(ctx, ml.RescueSummaryInput{
-		DispatchTranscription: meta.Transcription,
-		DispatchCallType:      "Rescue - Trail",
-		TACChannel:            meta.TACChannel,
-		TACTranscripts:        transcripts,
-		PreviousSummary:       previousSummary,
-		UnitContext:           unitContext,
-	})
+	summary, err := tc.mlClient.SummarizeRescue(ctx, input)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			slog.Warn("live interpretation: shutdown interrupted summarize", slog.String("error", err.Error()))
@@ -205,21 +187,58 @@ func (tc *TranscribeClient) runOneSummaryPass(ctx context.Context, tacTGID, list
 		return false
 	}
 
-	tc.publishLiveInterpretation(ctx, tacTGID, meta, summary, listTTL)
+	tc.publishLiveInterpretation(ctx, tacTGID, meta, summary, tc.transcriptsTTL())
 	slog.Info("live interpretation: posted summary",
 		slog.String("tgid", tacTGID),
-		slog.Int("transcripts_count", len(transcripts)),
+		slog.Int("transcripts_count", len(input.TACTranscripts)), slog.Int("operator_corrections", len(input.OperatorCorrections)), slog.Bool("rewrite", rewrite),
 		slog.String("headline", summary.Headline))
 	return true
+}
+
+// buildSummaryInput turns the stored entries into the summarizer input: radio entries (with
+// human corrections applied and flagged) become TACTranscripts, live operator entries become
+// OperatorCorrections, and invalid/tombstoned entries are skipped.
+func buildSummaryInput(meta ClosureMeta, entries []liveTranscriptEntry, previous *ml.RescueSummary, unitContext string) ml.RescueSummaryInput {
+	in := ml.RescueSummaryInput{
+		DispatchTranscription: meta.Transcription,
+		DispatchCallType:      "Rescue - Trail",
+		TACChannel:            meta.TACChannel,
+		TACTranscripts:        make([]ml.TACTranscript, 0, len(entries)),
+		PreviousSummary:       previous,
+		UnitContext:           unitContext,
+		DispatchVerified:      meta.DispatchCorrection != nil,
+	}
+	for _, e := range entries {
+		switch e.kind() {
+		case entryKindRadio:
+			in.TACTranscripts = append(in.TACTranscripts, ml.TACTranscript{
+				CapturedAt: e.CapturedAt, Text: e.effectiveText(), Verified: e.Correction != nil,
+			})
+		case entryKindOperator:
+			if e.Deleted || strings.TrimSpace(e.Text) == "" {
+				continue
+			}
+			in.OperatorCorrections = append(in.OperatorCorrections, ml.OperatorCorrection{At: e.CapturedAt, Text: e.Text})
+		}
+	}
+	return in
 }
 
 // publishLiveInterpretation posts (or chat.updates) the running-summary message in the
 // rescue thread. The message_ts is cached in summary_ts:<TGID> with the same TTL as the
 // transcripts list so an active rescue keeps a stable summary anchor.
+//
+// It also decides whether the parent alert needs a re-render. The SAR badge and brief on the
+// parent follow the LATEST summary (not a latch): the parent is re-rendered at most once per
+// pass, and only on a SAR false→true flip or a (case/whitespace-normalized) brief change. That
+// refresh runs AFTER the Live Interpretation post/update so a rate-limited parent update never
+// delays the thread message.
 func (tc *TranscribeClient) publishLiveInterpretation(ctx context.Context, tacTGID string, meta ClosureMeta, summary *ml.RescueSummary, ttl time.Duration) {
-	// Read the previous SAR-notified state BEFORE overwriting summary_data, so we can detect
-	// the false→true transition and badge the parent alert exactly once (see below).
-	wasNotified := tc.summarySARNotified(ctx, tacTGID)
+	// Read the previous summary BEFORE overwriting summary_data, so we can detect the SAR
+	// false→true transition and brief changes and re-render the parent alert only then.
+	prevSummary, _ := tc.readSummaryData(ctx, tacTGID)
+	wasNotified := prevSummary != nil && prevSummary.SARNotified
+	prevBrief := normalizeBrief(FormatBrief(prevSummary))
 
 	// Cache the latest structured summary so the close path can prefill the feedback form
 	// without needing to re-run the LLM. Best-effort — if this write fails the live message
@@ -232,14 +251,27 @@ func (tc *TranscribeClient) publishLiveInterpretation(ctx context.Context, tacTG
 		}
 	}
 
-	// On the first transmission that reports SAR notification, badge the parent alert with the
-	// green check. Gated on the false→true transition (via the pre-write read above) so we do
-	// exactly one extra chat.update per rescue, not one per subsequent transmission. SAR
-	// notification is monotonic — the mention stays in the cumulative transcript history — so
-	// once badged it stays badged.
-	if summary.SARNotified && !wasNotified {
-		tc.badgeParentAlertSAR(ctx, tacTGID, meta)
+	// Decide (now, against the pre-overwrite summary) whether the parent alert needs a re-render:
+	// only when something visible on it changed — SAR false→true, or the page-out brief. The
+	// refresh itself is deferred until after the Live Interpretation post/update below; it
+	// reads summary_data (written just above), so it carries both decorations.
+	sarFlipped := summary.SARNotified && !wasNotified
+	briefChanged := normalizeBrief(FormatBrief(summary)) != prevBrief
+	if !sarFlipped && !briefChanged {
+		slog.Debug("live interpretation: parent refresh suppressed; no visible change",
+			slog.String("tgid", tacTGID),
+			slog.Bool("brief_drift_ignored", FormatBrief(summary) != FormatBrief(prevSummary)))
 	}
+	defer func() {
+		switch {
+		case sarFlipped && briefChanged:
+			tc.refreshParentAlert(ctx, tacTGID, meta, "sar_notified+brief_changed")
+		case sarFlipped:
+			tc.refreshParentAlert(ctx, tacTGID, meta, "sar_notified")
+		case briefChanged:
+			tc.refreshParentAlert(ctx, tacTGID, meta, "brief_changed")
+		}
+	}()
 
 	blocks := BuildLiveInterpretationBlocks(summary, time.Now().Local())
 	fallback := summary.Headline
@@ -287,51 +319,37 @@ func (tc *TranscribeClient) publishLiveInterpretation(ctx context.Context, tacTG
 	}
 }
 
-// badgeParentAlertSAR re-renders the parent rescue alert with the green-check "Search &
-// Rescue notified" badge and chat.update's it in place. Called once per rescue on the
-// SAR-notified transition. Best-effort: any failure logs and returns — the live
-// interpretation message still carries the SAR badge regardless.
+// refreshParentAlert re-renders the parent rescue alert (SAR badge + page-out brief) and
+// chat.update's it in place. Called at most once per summary pass, when the SAR false→true flip
+// fires and/or the brief changed. Best-effort: any failure logs and returns — the live
+// interpretation message still carries the same information regardless.
 //
-// The current expiry is read from the active_tacs ZSET (score = unix expiry) so the live
-// "Expires …" line stays accurate — including after an Extend — without threading the expiry
-// through ClosureMeta. If the expiry can't be read (rescue already closing/closed), skip
-// rather than render a bogus timestamp.
-func (tc *TranscribeClient) badgeParentAlertSAR(ctx context.Context, tgid string, meta ClosureMeta) {
-	if meta.MessageTS == "" || meta.Transcription == "" {
-		return // no message to update, or can't rebuild the alert faithfully
+// rerenderParentAlert re-reads tac_meta, summary_data, and the active_tacs expiry on every
+// attempt (including a rate-limit retry): the caller's meta was read at the start of a summary
+// pass that may have spent ~120s in the LLM, and a dispatch correction landing in that window
+// would otherwise be rendered away — permanently, since corrections are one-shot. It also
+// skips when the rescue is closing. The passed meta is only a fallback for a failed read.
+func (tc *TranscribeClient) refreshParentAlert(ctx context.Context, tgid string, meta ClosureMeta, reason string) {
+	meta = tc.freshClosureMeta(ctx, tgid, meta)
+	if tc.rerenderParentAlert(ctx, meta, "") {
+		slog.Info("live interpretation: refreshed parent alert",
+			slog.String("tgid", tgid), slog.String("tac", meta.TACChannel), slog.String("reason", reason))
 	}
+}
 
-	score, err := tc.dragonflyClient.ZScore(ctx, activeTACsKey, tgid)
-	if err != nil {
-		slog.Warn("live interpretation: SAR badge skipped; could not read expiry from active_tacs",
-			slog.String("error", err.Error()), slog.String("tgid", tgid))
-		return
+// normalizeBrief case-folds and whitespace-normalizes a rendered brief so trivial model drift
+// ("54F · Ankle injury" vs "54f · ankle  injury") doesn't churn the parent alert.
+func normalizeBrief(b string) string {
+	return strings.Join(strings.Fields(strings.ToLower(b)), " ")
+}
+
+// freshClosureMeta re-reads tac_meta:<TGID>, returning fallback when the read fails or the key
+// is gone.
+func (tc *TranscribeClient) freshClosureMeta(ctx context.Context, tgid string, fallback ClosureMeta) ClosureMeta {
+	if fresh, ok := tc.readClosureMeta(ctx, tgid); ok {
+		return fresh
 	}
-	expiresAt := time.Unix(int64(score), 0).Local()
-
-	blocks := BuildRescueTrailBlocks(&RescueTrailBlocksInput{
-		TACChannel:        meta.TACChannel,
-		TranscriptionText: meta.Transcription,
-		ExpiresAt:         expiresAt,
-		DispatchTGID:      FireDispatch1TGID,
-		TACTalkgroupTGID:  meta.TGID, // keeps the Cancel/Close/Extend/Switch actions on the live alert
-		SARNotified:       true,
-	})
-
-	updateCtx, cancel := context.WithTimeout(ctx, tc.config.SlackTimeout)
-	defer cancel()
-	if _, _, _, err := tc.slackClient.UpdateMessageContext(updateCtx,
-		tc.config.SlackChannelID,
-		meta.MessageTS,
-		slack.MsgOptionBlocks(blocks...),
-		slack.MsgOptionText(fmt.Sprintf("%s — Search & Rescue notified", meta.TACChannel), false),
-	); err != nil {
-		slog.Warn("live interpretation: failed to badge parent alert with SAR-notified",
-			slog.String("error", err.Error()), slog.String("tgid", tgid), slog.String("message_ts", meta.MessageTS))
-		return
-	}
-	slog.Info("live interpretation: badged parent alert — SAR notified",
-		slog.String("tgid", tgid), slog.String("tac", meta.TACChannel))
+	return fallback
 }
 
 // sendSlackInThread is a convenience wrapper that goes through sendSlackWithRetry and also

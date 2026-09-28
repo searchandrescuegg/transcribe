@@ -3,7 +3,9 @@ package slackctl
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -91,6 +93,7 @@ func (s *SlackctlSuite) SetupTest() {
 		dfly: dfly,
 		cfg: &config.Config{
 			TacticalChannelActivationDuration: 30 * time.Minute,
+			WorkerTimeout:                     5 * time.Second,
 		},
 	}
 }
@@ -273,6 +276,156 @@ func (s *SlackctlSuite) TestSwitchTAC_UnknownNewTGID_Errors() {
 	s.preloadActiveTAC("1389", "TAC1", "ts-rescue-1")
 	_, _, _, err := s.controller.SwitchTAC(s.ctx, "1389", "9999")
 	s.Require().Error(err)
+}
+
+// upsertCall / removeCall / refreshCall record each fakeCorrections invocation so tests can
+// assert both the arguments a caller passed in AND (for refresh) what the controller decided
+// to do with the configured return values.
+type upsertCall struct {
+	threadTS, slackTS, userID, text string
+	at                              time.Time
+}
+
+type removeCall struct {
+	threadTS, slackTS, userID string
+}
+
+type refreshCall struct {
+	tgid    string
+	rewrite bool
+}
+
+type fakeCorrections struct {
+	mu       sync.Mutex
+	migrated [][2]string
+	migErr   error
+
+	// Configurable return values for UpsertOperatorCorrection / RemoveOperatorCorrection —
+	// set before exercising the controller, read (and calls recorded) under mu.
+	upsertTGID    string
+	upsertCreated bool
+	upsertErr     error
+	upsertCalls   []upsertCall
+	// Optional: when set, each Upsert signals upsertEntered then blocks until upsertRelease is
+	// closed (outside mu), so tests can hold an operation "inside" the service.
+	upsertEntered chan struct{}
+	upsertRelease chan struct{}
+
+	removeTGID    string
+	removeRemoved bool
+	removeErr     error
+	removeCalls   []removeCall
+
+	refreshCalls []refreshCall
+	// Optional: when refreshBlockN > 0, that many leading RefreshLiveInterpretation calls signal
+	// refreshEntered then block until refreshRelease is closed (outside mu), so tests can hold a
+	// refresh "in progress" — e.g. to prove it no longer holds the per-message stripe lock.
+	refreshBlockN  int
+	refreshBlocked int
+	refreshEntered chan struct{}
+	refreshRelease chan struct{}
+}
+
+func (f *fakeCorrections) ResolveCorrectionTarget(context.Context, string, string) (transcribe.CorrectionTarget, error) {
+	return transcribe.CorrectionTarget{}, nil
+}
+func (f *fakeCorrections) ApplyTranscriptCorrection(context.Context, transcribe.CorrectionTarget, string, string, time.Time) error {
+	return nil
+}
+func (f *fakeCorrections) UpsertOperatorCorrection(_ context.Context, threadTS, slackTS, userID, text string, at time.Time) (string, bool, error) {
+	f.mu.Lock()
+	f.upsertCalls = append(f.upsertCalls, upsertCall{threadTS, slackTS, userID, text, at})
+	entered, release := f.upsertEntered, f.upsertRelease
+	tgid, created, err := f.upsertTGID, f.upsertCreated, f.upsertErr
+	f.mu.Unlock()
+	if entered != nil {
+		entered <- struct{}{}
+	}
+	if release != nil {
+		<-release
+	}
+	return tgid, created, err
+}
+func (f *fakeCorrections) RemoveOperatorCorrection(_ context.Context, threadTS, slackTS, userID string) (string, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.removeCalls = append(f.removeCalls, removeCall{threadTS, slackTS, userID})
+	return f.removeTGID, f.removeRemoved, f.removeErr
+}
+func (f *fakeCorrections) MigrateOperatorCorrections(_ context.Context, oldTGID, newTGID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.migrated = append(f.migrated, [2]string{oldTGID, newTGID})
+	return f.migErr
+}
+func (f *fakeCorrections) RefreshLiveInterpretation(_ context.Context, tgid string, rewrite bool) {
+	f.mu.Lock()
+	f.refreshCalls = append(f.refreshCalls, refreshCall{tgid, rewrite})
+	var entered, release chan struct{}
+	if f.refreshBlocked < f.refreshBlockN {
+		f.refreshBlocked++
+		entered, release = f.refreshEntered, f.refreshRelease
+	}
+	f.mu.Unlock()
+	if entered != nil {
+		entered <- struct{}{}
+	}
+	if release != nil {
+		<-release
+	}
+}
+
+func (f *fakeCorrections) upsertCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.upsertCalls)
+}
+
+func (f *fakeCorrections) snapshot() (upserts []upsertCall, removes []removeCall, refreshes []refreshCall) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]upsertCall(nil), f.upsertCalls...), append([]removeCall(nil), f.removeCalls...), append([]refreshCall(nil), f.refreshCalls...)
+}
+
+func (s *SlackctlSuite) TestSwitchTAC_CarriesDispatchCorrectionAndMigratesNotes() {
+	s.preloadActiveTAC("1389", "TAC1", "ts-rescue-1")
+	// Give the old meta a transcription + correction.
+	raw, err := s.rdb.Get(s.ctx, fmt.Sprintf(tacMetaKeyFmt, "1389")).Result()
+	s.Require().NoError(err)
+	var meta transcribe.ClosureMeta
+	s.Require().NoError(json.Unmarshal([]byte(raw), &meta))
+	meta.Transcription = "fixed dispatch"
+	meta.DispatchS3Key = "obj.wav"
+	meta.DispatchCorrection = &transcribe.TranscriptCorrection{By: "U1", At: time.Now().UTC().Truncate(time.Second), Original: "orig"}
+	payload, _ := json.Marshal(meta)
+	s.Require().NoError(s.rdb.Set(s.ctx, fmt.Sprintf(tacMetaKeyFmt, "1389"), string(payload), time.Hour).Err())
+
+	fake := &fakeCorrections{migErr: errors.New("boom")} // a migration failure must not fail the switch
+	s.controller.corrections = fake
+
+	newMeta, _, ok, err := s.controller.SwitchTAC(s.ctx, "1389", "1963")
+	s.Require().NoError(err)
+	s.True(ok)
+	s.Equal("fixed dispatch", newMeta.Transcription)
+	s.Equal("obj.wav", newMeta.DispatchS3Key)
+	s.Require().NotNil(newMeta.DispatchCorrection)
+	s.Equal("U1", newMeta.DispatchCorrection.By)
+	s.Equal([][2]string{{"1389", "1963"}}, fake.migrated)
+}
+
+func TestCorrectionErrorMessage(t *testing.T) {
+	at := time.Date(2026, 9, 27, 15, 4, 0, 0, time.Local)
+	assert.Contains(t, correctionErrorMessage(&transcribe.AlreadyCorrectedError{
+		Correction: transcribe.TranscriptCorrection{By: "U9", At: at}}), "<@U9> at 15:04")
+	assert.Contains(t, correctionErrorMessage(transcribe.ErrRescueNotActive), "closed")
+	assert.Contains(t, correctionErrorMessage(transcribe.ErrNotCorrectable), "Only dispatch and radio")
+	assert.Contains(t, correctionErrorMessage(transcribe.ErrEmptyCorrection), "empty")
+	assert.Contains(t, correctionErrorMessage(transcribe.ErrUnchangedCorrection), "unchanged")
+	assert.Contains(t, correctionErrorMessage(errors.New("x")), "check service logs")
+	// Loser whose read of the winner's correction failed: no empty "<@> at 00:00".
+	empty := correctionErrorMessage(&transcribe.AlreadyCorrectedError{})
+	assert.Contains(t, empty, "already been corrected")
+	assert.NotContains(t, empty, "<@>")
 }
 
 func TestParseOldTGIDFromBlockID(t *testing.T) {

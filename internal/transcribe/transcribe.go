@@ -42,11 +42,13 @@ const (
 // subtyping, so production wiring is unchanged.
 //
 // UpdateMessageContext lets the sweeper rewrite the parent rescue alert when the auto-close
-// fires (remove the actions block, change "expires" to "auto-closed"). The signature mirrors
-// the slack-go method exactly so *slack.Client continues to satisfy the interface.
+// fires (remove the actions block, change "expires" to "auto-closed"). UploadFileV2Context
+// uploads transcription audio as file replies. The signatures mirror the slack-go methods
+// exactly so *slack.Client continues to satisfy the interface.
 type SlackPoster interface {
 	SendMessageContext(ctx context.Context, channelID string, options ...slack.MsgOption) (string, string, string, error)
 	UpdateMessageContext(ctx context.Context, channelID, timestamp string, options ...slack.MsgOption) (string, string, string, error)
+	UploadFileV2Context(ctx context.Context, params slack.UploadFileV2Parameters) (*slack.FileSummary, error)
 }
 
 // MLClient bundles the ML capabilities the worker uses: the dispatch-parser for turning a raw
@@ -316,13 +318,13 @@ func (tc *TranscribeClient) processRecord(ctx context.Context, record *s3event.E
 	}
 
 	if parsedKey.dk.Talkgroup == FireDispatch1TGID {
-		if err := tc.processDispatchCall(ctx, parsedKey, tr); err != nil {
+		if err := tc.processDispatchCall(ctx, parsedKey, tr, fileBytes); err != nil {
 			return fmt.Errorf("failed to process fire dispatch call (talkgroup=%s): %w", parsedKey.dk.Talkgroup, err)
 		}
 		return nil
 	}
 
-	if err := tc.processNonDispatchCall(ctx, parsedKey, tr); err != nil {
+	if err := tc.processNonDispatchCall(ctx, parsedKey, tr, fileBytes); err != nil {
 		return fmt.Errorf("failed to process non-dispatch call (talkgroup=%s): %w", parsedKey.dk.Talkgroup, err)
 	}
 	return nil

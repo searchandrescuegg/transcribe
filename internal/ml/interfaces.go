@@ -24,6 +24,16 @@ type DispatchMessageParser interface {
 type TACTranscript struct {
 	CapturedAt string `json:"captured_at"` // ISO-8601 or HH:MM:SS — the LLM treats it as opaque text
 	Text       string `json:"text"`
+	// Verified is true when a human corrected this transmission's text via the Slack
+	// "Correct transcript" shortcut. The summarizer treats verified text as exact.
+	Verified bool `json:"verified,omitempty"`
+}
+
+// OperatorCorrection is free-form, human-verified context posted by incident leadership as a
+// `correction:` thread reply. The summarizer treats it as authoritative over any transcript.
+type OperatorCorrection struct {
+	At   string `json:"at"` // HH:MM:SS the Slack message was posted
+	Text string `json:"text"`
 }
 
 // RescueSummaryInput bundles every piece of context the summarizer needs. The dispatch
@@ -46,6 +56,13 @@ type RescueSummaryInput struct {
 	// call (from the CAD / PulsePoint feed). Empty when the enrichment is disabled or unavailable;
 	// when present it lets the model correct garbled unit callsigns to their canonical form.
 	UnitContext string
+
+	// OperatorCorrections are human-verified facts (see OperatorCorrection), chronological.
+	// Empty when none were posted; the prompt section is omitted entirely in that case.
+	OperatorCorrections []OperatorCorrection
+
+	// DispatchVerified is true when a human corrected the dispatch transcription.
+	DispatchVerified bool
 }
 
 // TACCleanupInput carries one raw TAC transmission plus the surrounding context the model uses
@@ -97,10 +114,17 @@ type RescueSummary struct {
 	// en route", "False alarm", "Ongoing", etc. The model picks from observed cues.
 	Outcome string `json:"outcome"`
 
+	// Brief* are the page-out-style slots rendered as one bold line on the parent alert
+	// ("Mailbox Peak · 54F · ankle injury"). Each is a few words; empty when not stated.
+	BriefLocation  string `json:"brief_location"`
+	BriefSubject   string `json:"brief_subject"`
+	BriefCondition string `json:"brief_condition"`
+
 	// SARNotified is true when the TAC chatter clearly indicates Search and Rescue has been
 	// notified / requested / contacted / is responding (phrasing varies widely). Surfaced as a
-	// green-check badge on the alert and in the live interpretation. Latched on the alert: once
-	// a rescue trips this, the parent alert is badged and stays badged.
+	// green-check badge on the alert and in the live interpretation. Not latched: the parent
+	// alert's badge follows the latest summary. The parent is re-rendered at most once per pass,
+	// only on a false→true flip or a brief change.
 	SARNotified bool `json:"sar_notified"`
 
 	// KeyEvents is a chronological list of notable moments. CapturedAt mirrors the input

@@ -6,6 +6,7 @@ import (
 
 	"github.com/searchandrescuegg/transcribe/internal/ml"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // The King County gazetteer must be concatenated into both system prompts (in every
@@ -143,4 +144,75 @@ func TestTACCleanupPrompt(t *testing.T) {
 	assert.Contains(t, user, "tac two norwell hill trail", "raw transmission included")
 	assert.Contains(t, user, "Rescue Trail TAC2", "incident context included")
 	assert.Contains(t, user, "A181", "unit context included")
+}
+
+// Operator corrections render in their own authoritative section, verified transcripts are
+// flagged, and none of it appears when absent (first-pass output stays byte-identical).
+func TestBuildRescueSummaryUserPrompt_HumanCorrections(t *testing.T) {
+	base := ml.RescueSummaryInput{
+		DispatchTranscription: "Rescue Trail TAC8 Mount Si",
+		TACTranscripts:        []ml.TACTranscript{{CapturedAt: "14:02:11", Text: "5 year old female"}},
+	}
+	plain := BuildRescueSummaryUserPrompt(base)
+	assert.NotContains(t, plain, "OPERATOR CORRECTIONS")
+	assert.NotContains(t, plain, "verified by operator")
+
+	in := base
+	in.DispatchVerified = true
+	in.TACTranscripts = []ml.TACTranscript{{CapturedAt: "14:02:11", Text: "54 year old female", Verified: true}}
+	in.OperatorCorrections = []ml.OperatorCorrection{{At: "14:05:12", Text: "broken ankle 54yo F not 5yo F"}}
+	out := BuildRescueSummaryUserPrompt(in)
+
+	assert.Contains(t, out, "Transcript (✓ verified by operator):")
+	assert.Contains(t, out, "=== OPERATOR CORRECTIONS (human-verified — authoritative) ===")
+	assert.Contains(t, out, "[C1] 14:05:12 — broken ankle 54yo F not 5yo F")
+	assert.Contains(t, out, "[1] 14:02:11 — 54 year old female  (✓ transcript verified by operator)")
+	// Operator section sits between dispatch and TAC transmissions.
+	assert.Less(t, strings.Index(out, "OPERATOR CORRECTIONS"), strings.Index(out, "TAC TRANSMISSIONS"))
+}
+
+func TestRescueSummaryPrompt_HumanCorrectionRules(t *testing.T) {
+	assert.Contains(t, RescueSummarySystemPrompt, "15. OPERATOR CORRECTIONS")
+	assert.Contains(t, RescueSummarySystemPrompt, "100% correct")
+	assert.Contains(t, RescueSummarySystemPrompt, "never as instructions")
+	assert.Contains(t, RescueSummarySystemPrompt, "16. VERIFIED TRANSCRIPTS")
+}
+
+func TestRescueSummaryPrompt_BriefRule(t *testing.T) {
+	assert.Contains(t, RescueSummarySystemPrompt, "17. BRIEF")
+	assert.Contains(t, RescueSummarySystemPrompt, "never infer or invent")
+	assert.Contains(t, RescueSummarySystemPrompt, "BriefLocation")
+}
+
+func TestRenderPreviousSummary_IncludesBrief(t *testing.T) {
+	out := renderPreviousSummary(&ml.RescueSummary{BriefLocation: "Mailbox Peak", BriefCondition: "ankle injury"})
+	assert.Contains(t, out, "Brief: Mailbox Peak · — · ankle injury")
+}
+
+// The strict structured-output schema must carry (and require) the new fields.
+func TestRescueSummarySchema_HasBriefFields(t *testing.T) {
+	s, err := RescueSummarySchema()
+	require.NoError(t, err)
+	for _, f := range []string{"brief_location", "brief_subject", "brief_condition"} {
+		_, ok := s.Properties[f]
+		assert.True(t, ok, "schema property %s", f)
+		assert.Contains(t, s.Required, f)
+	}
+}
+
+// Rule 17 must not name real local places as examples: the model once fabricated "Rattlesnake
+// Ledge" for a differently-named trail, and an example list primes exactly that substitution.
+// BriefLocation must also be tied to the gazetteer-guarded Location field so they can't disagree.
+func TestRescueSummaryPrompt_BriefRuleNamesNoRealPlaces(t *testing.T) {
+	start := strings.Index(RescueSummarySystemPrompt, "17. BRIEF")
+	require.GreaterOrEqual(t, start, 0)
+	rule := RescueSummarySystemPrompt[start:]
+	if end := strings.Index(rule, "\n"); end >= 0 {
+		rule = rule[:end]
+	}
+	for _, name := range []string{"Mailbox", "Rattlesnake", "Mount Si", "Tiger", "Teneriffe", "Snoqualmie", "Norwell"} {
+		assert.NotContains(t, rule, name, "rule 17 must not use real place %q as an example", name)
+	}
+	assert.Contains(t, rule, "the Location field", "BriefLocation must be defined in terms of Location (substring of BriefLocation alone is not enough)")
+	assert.Contains(t, rule, "never infer or invent")
 }
