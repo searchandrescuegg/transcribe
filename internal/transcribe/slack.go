@@ -42,8 +42,8 @@ type RescueTrailBlocksInput struct {
 	ClosedAt          *time.Time
 	FeedbackURL       string
 	// SARNotified renders a green-check "Search & Rescue notified" badge on the alert when
-	// the live interpretation detects SAR has been contacted. Latched by the caller, so once
-	// set it persists through the closed-mode rewrite too.
+	// the live interpretation detects SAR has been contacted. Callers pass the latest
+	// summary's value (not a latch), for the live re-render and the closed-mode rewrite alike.
 	SARNotified bool
 	// Correction renders the ":pencil2: Corrected by" label under the transcription when a
 	// human corrected the dispatch text. Nil keeps the alert byte-identical to before.
@@ -585,8 +585,8 @@ func FormatBrief(s *ml.RescueSummary) string {
 	}
 	var parts []string
 	for _, slot := range []string{s.BriefLocation, s.BriefSubject, s.BriefCondition} {
+		slot = strings.NewReplacer("*", "", "_", "", "`", "", "~", "").Replace(slot)
 		slot = strings.Join(strings.Fields(slot), " ")
-		slot = strings.NewReplacer("*", "", "_", "").Replace(slot)
 		if slot == "" {
 			continue
 		}

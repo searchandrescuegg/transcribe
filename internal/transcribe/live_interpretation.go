@@ -226,12 +226,18 @@ func buildSummaryInput(meta ClosureMeta, entries []liveTranscriptEntry, previous
 // publishLiveInterpretation posts (or chat.updates) the running-summary message in the
 // rescue thread. The message_ts is cached in summary_ts:<TGID> with the same TTL as the
 // transcripts list so an active rescue keeps a stable summary anchor.
+//
+// It also decides whether the parent alert needs a re-render. The SAR badge and brief on the
+// parent follow the LATEST summary (not a latch): the parent is re-rendered at most once per
+// pass, and only on a SAR false→true flip or a (case/whitespace-normalized) brief change. That
+// refresh runs AFTER the Live Interpretation post/update so a rate-limited parent update never
+// delays the thread message.
 func (tc *TranscribeClient) publishLiveInterpretation(ctx context.Context, tacTGID string, meta ClosureMeta, summary *ml.RescueSummary, ttl time.Duration) {
 	// Read the previous summary BEFORE overwriting summary_data, so we can detect the SAR
 	// false→true transition and brief changes and re-render the parent alert only then.
 	prevSummary, _ := tc.readSummaryData(ctx, tacTGID)
 	wasNotified := prevSummary != nil && prevSummary.SARNotified
-	prevBrief := FormatBrief(prevSummary)
+	prevBrief := normalizeBrief(FormatBrief(prevSummary))
 
 	// Cache the latest structured summary so the close path can prefill the feedback form
 	// without needing to re-run the LLM. Best-effort — if this write fails the live message
@@ -244,19 +250,27 @@ func (tc *TranscribeClient) publishLiveInterpretation(ctx context.Context, tacTG
 		}
 	}
 
-	// Re-render the parent alert at most once per pass, and only when something visible on it
-	// changed: the SAR badge latching on (false→true) or the page-out brief changing. The
-	// re-render reads summary_data (written just above), so it carries both decorations.
+	// Decide (now, against the pre-overwrite summary) whether the parent alert needs a re-render:
+	// only when something visible on it changed — SAR false→true, or the page-out brief. The
+	// refresh itself is deferred until after the Live Interpretation post/update below; it
+	// reads summary_data (written just above), so it carries both decorations.
 	sarFlipped := summary.SARNotified && !wasNotified
-	briefChanged := FormatBrief(summary) != prevBrief
-	switch {
-	case sarFlipped && briefChanged:
-		tc.refreshParentAlert(ctx, tacTGID, meta, "sar_notified+brief_changed")
-	case sarFlipped:
-		tc.refreshParentAlert(ctx, tacTGID, meta, "sar_notified")
-	case briefChanged:
-		tc.refreshParentAlert(ctx, tacTGID, meta, "brief_changed")
+	briefChanged := normalizeBrief(FormatBrief(summary)) != prevBrief
+	if !sarFlipped && !briefChanged {
+		slog.Debug("live interpretation: parent refresh suppressed; no visible change",
+			slog.String("tgid", tacTGID),
+			slog.Bool("brief_drift_ignored", FormatBrief(summary) != FormatBrief(prevSummary)))
 	}
+	defer func() {
+		switch {
+		case sarFlipped && briefChanged:
+			tc.refreshParentAlert(ctx, tacTGID, meta, "sar_notified+brief_changed")
+		case sarFlipped:
+			tc.refreshParentAlert(ctx, tacTGID, meta, "sar_notified")
+		case briefChanged:
+			tc.refreshParentAlert(ctx, tacTGID, meta, "brief_changed")
+		}
+	}()
 
 	blocks := BuildLiveInterpretationBlocks(summary, time.Now().Local())
 	fallback := summary.Headline
@@ -305,33 +319,27 @@ func (tc *TranscribeClient) publishLiveInterpretation(ctx context.Context, tacTG
 }
 
 // refreshParentAlert re-renders the parent rescue alert (SAR badge + page-out brief) and
-// chat.update's it in place. Called at most once per summary pass, when the SAR-notified
-// transition fires and/or the brief changed. Best-effort: any failure logs and returns — the
-// live interpretation message still carries the same information regardless.
+// chat.update's it in place. Called at most once per summary pass, when the SAR false→true flip
+// fires and/or the brief changed. Best-effort: any failure logs and returns — the live
+// interpretation message still carries the same information regardless.
 //
-// The current expiry is read from the active_tacs ZSET (score = unix expiry) so the live
-// "Expires …" line stays accurate — including after an Extend — without threading the expiry
-// through ClosureMeta. If the expiry can't be read (rescue already closing/closed), skip
-// rather than render a bogus timestamp.
-//
-// meta is re-read first: the caller's copy was read at the start of a summary pass that may
-// have spent ~120s in the LLM, and a dispatch correction landing in that window would otherwise
-// be rendered away — permanently, since corrections are one-shot. The passed meta is only a
-// fallback for a failed/missing read.
+// rerenderParentAlert re-reads tac_meta, summary_data, and the active_tacs expiry on every
+// attempt (including a rate-limit retry): the caller's meta was read at the start of a summary
+// pass that may have spent ~120s in the LLM, and a dispatch correction landing in that window
+// would otherwise be rendered away — permanently, since corrections are one-shot. It also
+// skips when the rescue is closing. The passed meta is only a fallback for a failed read.
 func (tc *TranscribeClient) refreshParentAlert(ctx context.Context, tgid string, meta ClosureMeta, reason string) {
 	meta = tc.freshClosureMeta(ctx, tgid, meta)
-	fallback := fmt.Sprintf("%s — rescue alert updated", meta.TACChannel)
-	if s, ok := tc.readSummaryData(ctx, tgid); ok {
-		if brief := FormatBrief(s); brief != "" {
-			fallback = fmt.Sprintf("%s — %s", meta.TACChannel, brief)
-		} else if s.SARNotified {
-			fallback = fmt.Sprintf("%s — Search & Rescue notified", meta.TACChannel)
-		}
-	}
-	if tc.rerenderParentAlert(ctx, meta, fallback) {
+	if tc.rerenderParentAlert(ctx, meta, "") {
 		slog.Info("live interpretation: refreshed parent alert",
 			slog.String("tgid", tgid), slog.String("tac", meta.TACChannel), slog.String("reason", reason))
 	}
+}
+
+// normalizeBrief case-folds and whitespace-normalizes a rendered brief so trivial model drift
+// ("54F · Ankle injury" vs "54f · ankle  injury") doesn't churn the parent alert.
+func normalizeBrief(b string) string {
+	return strings.Join(strings.Fields(strings.ToLower(b)), " ")
 }
 
 // freshClosureMeta re-reads tac_meta:<TGID>, returning fallback when the read fails or the key

@@ -10,43 +10,99 @@ import (
 	"time"
 
 	"github.com/searchandrescuegg/transcribe/internal/dataset"
+	"github.com/searchandrescuegg/transcribe/internal/ml"
 	"github.com/slack-go/slack"
 )
 
-// rerenderParentAlert rebuilds the live (not closed) rescue alert from meta plus the latest
+// rerenderParentAlert rebuilds the live (not closed) rescue alert from the latest tac_meta plus
 // summary_data — transcription, dispatch-correction label, brief, SAR badge, status line, action
 // buttons — and chat.updates it. It is the single live parent-alert render path: it derives the
 // SAR badge and brief itself so no caller (summary pass, dispatch correction) can drop another's
-// decoration. The current expiry comes from active_tacs; if it can't be read the rescue is
-// closing, so skip. Best-effort: returns false on any failure.
+// decoration. Best-effort: returns false on any failure or skip.
+//
+// Skips (no chat.update) when the rescue is closing or closed: the expiry in active_tacs can't
+// be read, or it is not in the future (Close sets the score to now-1 until the sweeper's next
+// tick). A live render then would put live buttons and a past expiry over the closed alert.
+//
+// Rebuild-on-retry: a retryable rate limit waits RetryAfter and then RE-RENDERS from current
+// state rather than resending the blocks built before the wait, so a rescue that closed (or a
+// brief / dispatch correction that changed) during the wait is never overwritten with stale
+// content. meta is only a fallback when tac_meta can't be read. An empty fallback text is
+// derived from the freshly-read state.
 func (tc *TranscribeClient) rerenderParentAlert(ctx context.Context, meta ClosureMeta, fallback string) bool {
 	if meta.MessageTS == "" || meta.Transcription == "" {
 		return false
 	}
-	score, err := tc.dragonflyClient.ZScore(ctx, activeTACsKey, meta.TGID)
-	if err != nil {
-		slog.Warn("parent alert re-render skipped; could not read expiry from active_tacs",
-			slog.String("error", err.Error()), slog.String("tgid", meta.TGID))
-		return false
+	// render returns attempted=false when it skipped without calling Slack.
+	render := func() (attempted bool, err error) {
+		score, err := tc.dragonflyClient.ZScore(ctx, activeTACsKey, meta.TGID)
+		if err != nil {
+			slog.Warn("parent alert re-render skipped; could not read expiry from active_tacs",
+				slog.String("error", err.Error()), slog.String("tgid", meta.TGID))
+			return false, nil
+		}
+		expiresAt := time.Unix(int64(score), 0)
+		if !expiresAt.After(time.Now()) {
+			slog.Debug("parent alert re-render skipped; rescue is closing",
+				slog.String("tgid", meta.TGID), slog.Time("expires_at", expiresAt))
+			return false, nil
+		}
+		m := tc.freshClosureMeta(ctx, meta.TGID, meta)
+		if m.MessageTS == "" || m.Transcription == "" {
+			return false, nil
+		}
+		summary, _ := tc.readSummaryData(ctx, meta.TGID)
+		text := fallback
+		if text == "" {
+			text = parentAlertFallback(m, summary)
+		}
+		blocks := BuildRescueTrailBlocks(&RescueTrailBlocksInput{
+			TACChannel:        m.TACChannel,
+			TranscriptionText: m.Transcription,
+			ExpiresAt:         expiresAt.Local(),
+			DispatchTGID:      FireDispatch1TGID,
+			TACTalkgroupTGID:  m.TGID,
+			SARNotified:       summary != nil && summary.SARNotified,
+			Correction:        m.DispatchCorrection,
+			Brief:             FormatBrief(summary),
+		})
+		uctx, cancel := context.WithTimeout(ctx, tc.config.SlackTimeout)
+		defer cancel()
+		_, _, _, err = tc.slackClient.UpdateMessageContext(uctx, tc.config.SlackChannelID, m.MessageTS,
+			slack.MsgOptionBlocks(blocks...), slack.MsgOptionText(text, false))
+		return true, err
 	}
-	summary, _ := tc.readSummaryData(ctx, meta.TGID)
-	blocks := BuildRescueTrailBlocks(&RescueTrailBlocksInput{
-		TACChannel:        meta.TACChannel,
-		TranscriptionText: meta.Transcription,
-		ExpiresAt:         time.Unix(int64(score), 0).Local(),
-		DispatchTGID:      FireDispatch1TGID,
-		TACTalkgroupTGID:  meta.TGID,
-		SARNotified:       summary != nil && summary.SARNotified,
-		Correction:        meta.DispatchCorrection,
-		Brief:             FormatBrief(summary),
-	})
-	if err := tc.updateMessageWithRetry(ctx, meta.MessageTS,
-		slack.MsgOptionBlocks(blocks...), slack.MsgOptionText(fallback, false)); err != nil {
+
+	attempted, err := render()
+	var rate *slack.RateLimitedError
+	if errors.As(err, &rate) && rate.Retryable() {
+		select {
+		case <-ctx.Done():
+			err = ctx.Err()
+		case <-time.After(rate.RetryAfter):
+			attempted, err = render()
+		}
+	}
+	if err != nil {
 		slog.Warn("parent alert re-render failed",
 			slog.String("error", err.Error()), slog.String("tgid", meta.TGID), slog.String("message_ts", meta.MessageTS))
 		return false
 	}
-	return true
+	return attempted
+}
+
+// parentAlertFallback is the notification/fallback text for a parent-alert re-render: the brief
+// when there is one, else the SAR badge text, else a generic "updated".
+func parentAlertFallback(meta ClosureMeta, s *ml.RescueSummary) string {
+	if s != nil {
+		if brief := FormatBrief(s); brief != "" {
+			return fmt.Sprintf("%s — %s", meta.TACChannel, brief)
+		}
+		if s.SARNotified {
+			return fmt.Sprintf("%s — Search & Rescue notified", meta.TACChannel)
+		}
+	}
+	return fmt.Sprintf("%s — rescue alert updated", meta.TACChannel)
 }
 
 // correctedGuardKeyFmt is the one-shot guard for the "Correct transcript" shortcut, keyed by the
@@ -258,8 +314,9 @@ func (tc *TranscribeClient) applyDispatchCorrection(ctx context.Context, target 
 }
 
 // updateMessageWithRetry chat.updates a post, retrying once on a retryable rate limit. Each
-// attempt is bounded by SlackTimeout. Shared by both relabel paths (TAC entry, dispatch
-// parent alert) so neither drops the retry the other has. Best-effort: the stored correction
+// attempt is bounded by SlackTimeout. Used by the TAC-post relabel path; it resends the same
+// blocks, so it must NOT be used for the parent alert (rerenderParentAlert rebuilds on retry
+// instead, because that alert's content can change during the wait). Best-effort: the stored correction
 // is authoritative; the label is presentation — callers log the returned error and move on.
 func (tc *TranscribeClient) updateMessageWithRetry(ctx context.Context, ts string, opts ...slack.MsgOption) error {
 	update := func() error {

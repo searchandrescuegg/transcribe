@@ -22,6 +22,7 @@ func TestFormatBrief(t *testing.T) {
 		{"all slots", &ml.RescueSummary{BriefLocation: "Mailbox Peak", BriefSubject: "54F", BriefCondition: "ankle injury"}, "Mailbox Peak · 54F · ankle injury"},
 		{"empty middle dropped", &ml.RescueSummary{BriefLocation: "Tiger Mtn", BriefCondition: "cardiac"}, "Tiger Mtn · cardiac"},
 		{"whitespace collapsed", &ml.RescueSummary{BriefLocation: "  Mailbox\n  Peak ", BriefSubject: "   "}, "Mailbox Peak"},
+		{"code and strike markers stripped", &ml.RescueSummary{BriefLocation: "`trail`", BriefCondition: "~ankle~ injury"}, "trail · ankle injury"},
 		{"mrkdwn escaped and bold-breakers stripped", &ml.RescueSummary{BriefLocation: "A & B <x>", BriefCondition: "*bad*_leg_"}, "A &amp; B &lt;x&gt; · badleg"},
 	}
 	for _, tc := range cases {
