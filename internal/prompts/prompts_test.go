@@ -199,3 +199,20 @@ func TestRescueSummarySchema_HasBriefFields(t *testing.T) {
 		assert.Contains(t, s.Required, f)
 	}
 }
+
+// Rule 17 must not name real local places as examples: the model once fabricated "Rattlesnake
+// Ledge" for a differently-named trail, and an example list primes exactly that substitution.
+// BriefLocation must also be tied to the gazetteer-guarded Location field so they can't disagree.
+func TestRescueSummaryPrompt_BriefRuleNamesNoRealPlaces(t *testing.T) {
+	start := strings.Index(RescueSummarySystemPrompt, "17. BRIEF")
+	require.GreaterOrEqual(t, start, 0)
+	rule := RescueSummarySystemPrompt[start:]
+	if end := strings.Index(rule, "\n"); end >= 0 {
+		rule = rule[:end]
+	}
+	for _, name := range []string{"Mailbox", "Rattlesnake", "Mount Si", "Tiger", "Teneriffe", "Snoqualmie", "Norwell"} {
+		assert.NotContains(t, rule, name, "rule 17 must not use real place %q as an example", name)
+	}
+	assert.Contains(t, rule, "the Location field", "BriefLocation must be defined in terms of Location (substring of BriefLocation alone is not enough)")
+	assert.Contains(t, rule, "never infer or invent")
+}
