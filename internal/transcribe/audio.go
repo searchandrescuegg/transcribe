@@ -12,7 +12,8 @@ import (
 
 const (
 	// audioUploadTimeout bounds one upload (URL fetch + PUT + complete) so a slow Slack upload
-	// can't eat the worker's budget; it sits well inside WorkerTimeout.
+	// can't eat the whole worker budget. It counts toward the worker's serial LLM-call-plus-upload
+	// budget alongside TAC cleanup and the summary call — see CLAUDE.md invariant #7.
 	audioUploadTimeout = 20 * time.Second
 	// maxAudioAttachmentBytes skips pathological files; trunk-recorder calls are far smaller.
 	maxAudioAttachmentBytes = 20 << 20

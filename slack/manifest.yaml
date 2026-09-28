@@ -93,6 +93,9 @@ oauth_config:
       - groups:history
       # reactions:write — ✅ / ⚠️ on a `correction:` reply to show whether it was applied.
       - reactions:write
+      # files:write — upload each transcription's audio (WAV) as a reply in the rescue thread so
+      # responders can listen to what the ASR heard. Gated by AUDIO_ATTACHMENTS_ENABLED.
+      - files:write
 
 settings:
   org_deploy_enabled: false

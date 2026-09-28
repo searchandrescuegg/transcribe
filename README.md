@@ -258,6 +258,11 @@ actions row.
    requires the bot to be a **member of the alert channel** (`/invite @transcribe`) — it needs
    `message` events from that channel to see `correction:` replies, and `chat:write.public`
    alone does not deliver those events.
+7. **Audio attachments** — each transcription's WAV is posted as a reply right under its post
+   (TAC transmissions, the dispatch alert, re-pages) so you can listen when the transcript looks
+   wrong. Needs the `files:write` scope (in the manifest) — reinstall the app, then compare
+   **OAuth & Permissions → Bot User OAuth Token** with `SLACK_TOKEN` and update it if Slack
+   issued a new one. Turn off with `AUDIO_ATTACHMENTS_ENABLED=false`.
 
 #### Live interpretation
 

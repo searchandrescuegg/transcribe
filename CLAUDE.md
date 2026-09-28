@@ -55,6 +55,7 @@ button opens a Google Form prefilled with incident context.
 | Delete button targets the clicked message, not `tac_meta.MessageTS` | Orphaned duplicates share a TGID with the live alert, so a TGID-keyed delete would nuke the live one. `rescue_delete` deletes `payload.Container.MessageTs` and only tears down state when that ts IS the live alert. | `slackctl/delete.go` |
 | Trail-rescue detection has a transcription safety net, not just the LLM call_type | The LLM classifier can mislabel a trail rescue as another rescue subtype (prod 2026-07-15: "Rescue Trail Tac 2" → "Rescue - General" → **no alert**). A missed trail rescue is the worst failure mode, so `selectTrailRescueMessage` salvages any dispatch whose RAW transcription says "rescue trail"/"trail rescue" (adjacent phrase — narrow to avoid false positives), taking the TAC from the parsed message or a regex on the text. Prompt also nudges toward the trail-rescue value. | `rules.go` (`transcriptionSignalsTrailRescue`, `tacChannelFromText`), `process.go` (`selectTrailRescueMessage`), `prompts.go` |
 | Human corrections: one-shot transcript edits (message shortcut) + `correction:` thread notes, stored in existing `tac_transcripts` entries / `tac_meta` | Humans fix ASR errors and add verified context the summary treats as authoritative, with no new per-TGID sidecar keys. transcribe owns state; slackctl is an adapter via `CorrectionService`. Edits/retractions force a full-rewrite pass (`summary_stale="rewrite"`) so superseded facts don't linger. Dispatch corrections write `tac_meta` with `SetXX` (SET XX KEEPTTL) rather than `Set`, so a rescue that closed mid-correction can't be resurrected — see invariant #12 | `internal/transcribe/corrections.go`, `operator_corrections.go`, `transcript_entries.go`, `internal/slackctl/correct_transcript.go`, `operator_corrections.go` |
+| Transcription audio as a threaded file reply | Responders can listen when the ASR is garbled. The transcript post is unchanged (correction targeting keys on its ts); the WAV is uploaded as a separate reply right after it via `UploadFileV2Context`, using bytes `processRecord` already fetched for ASR. Best-effort (never fails/nacks the record), flag `AUDIO_ATTACHMENTS_ENABLED`, `files:write` scope. Dispatch-alert audio uploads only after the rescue is fully registered; TAC audio uploads before the summary LLM call | `internal/transcribe/audio.go` (`attachAudio`), `process.go` (call sites) |
 
 ---
 
@@ -98,13 +99,16 @@ Each was discovered (and fixed) during development; comments in code reference t
    closed-then-reopened rescue inherits stale state from the prior incident. (`sweeper.go`,
    `slackctl/cancel.go`, `slackctl/switch_tac.go`)
 
-7. **`WorkerTimeout` must cover EVERY serial LLM call in a worker, not just one** — the worker
-   context wraps the whole record. A TAC transmission now runs the cleanup call THEN the summary
-   call sequentially, so the budget must exceed `TACCleanupTimeout + summary round-trip` (plus S3
-   + ASR), not merely one LLM timeout. `TACCleanupTimeout` (default 20s) sub-bounds the cleanup so
-   it can't starve the thread reply + summary; keep `WorkerTimeout` comfortably above the sum.
-   Currently 180s worker vs 120s OpenAI (or 30s Anthropic) per call. (`internal/config/config.go`,
-   `process.go` `maybeCleanTranscript`)
+7. **`WorkerTimeout` must cover EVERY serial step in a worker, not just one LLM call** — the
+   worker context wraps the whole record. A TAC transmission now runs the cleanup call, then the
+   audio upload (`audioUploadTimeout`, 20s), then the summary call, sequentially, so the budget
+   must exceed `TACCleanupTimeout + audioUploadTimeout + summary round-trip` (plus S3 + ASR), not
+   merely one LLM timeout. `TACCleanupTimeout` (default 20s) sub-bounds the cleanup and
+   `audioUploadTimeout` sub-bounds the upload so neither can starve the thread reply + summary;
+   keep `WorkerTimeout` comfortably above the sum. `WORKER_TIMEOUT`'s code default is 30s — too
+   tight once cleanup and audio uploads are both on; recommend ≥ 90s for deployments running with
+   both enabled. (`internal/config/config.go`, `process.go` `maybeCleanTranscript`,
+   `internal/transcribe/audio.go`)
 
 8. **`time.Local` override happens BEFORE any time-formatting code runs** — set in
    `main.go` immediately after config + slog are wired. Tests that depend on display
@@ -291,6 +295,7 @@ read TGID from the button's `value` field instead.
 | `cmd/test-summary/main.go` | Iterate on the rescue-summarizer prompt against arbitrary `{dispatch, tac[]}` JSON |
 | `internal/transcribe/transcribe.go` | `Work`, `handleMessage`, `processRecord` — top-level message lifecycle |
 | `internal/transcribe/process.go` | `processDispatchCall`, `processNonDispatchCall` |
+| `internal/transcribe/audio.go` | `attachAudio` / `audioTitle` — best-effort threaded WAV upload |
 | `internal/transcribe/sweeper.go` | `Sweep`, `sweepOnce`, `postChannelClosed`, `updateAlertForClosure` — durable closure scheduling |
 | `internal/transcribe/live_interpretation.go` | `updateLiveInterpretation` + per-TGID lock pattern; additive summary (prev summary fed back) |
 | `internal/transcribe/unit_context.go` | `unitContextFor` / `resolveAndCacheUnitContext` — per-rescue CAD unit-context cache (best-effort, nil-resolver safe) |
