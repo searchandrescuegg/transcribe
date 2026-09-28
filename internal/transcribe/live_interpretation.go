@@ -227,9 +227,11 @@ func buildSummaryInput(meta ClosureMeta, entries []liveTranscriptEntry, previous
 // rescue thread. The message_ts is cached in summary_ts:<TGID> with the same TTL as the
 // transcripts list so an active rescue keeps a stable summary anchor.
 func (tc *TranscribeClient) publishLiveInterpretation(ctx context.Context, tacTGID string, meta ClosureMeta, summary *ml.RescueSummary, ttl time.Duration) {
-	// Read the previous SAR-notified state BEFORE overwriting summary_data, so we can detect
-	// the false→true transition and badge the parent alert exactly once (see below).
-	wasNotified := tc.summarySARNotified(ctx, tacTGID)
+	// Read the previous summary BEFORE overwriting summary_data, so we can detect the SAR
+	// false→true transition and brief changes and re-render the parent alert only then.
+	prevSummary, _ := tc.readSummaryData(ctx, tacTGID)
+	wasNotified := prevSummary != nil && prevSummary.SARNotified
+	prevBrief := FormatBrief(prevSummary)
 
 	// Cache the latest structured summary so the close path can prefill the feedback form
 	// without needing to re-run the LLM. Best-effort — if this write fails the live message
@@ -242,13 +244,18 @@ func (tc *TranscribeClient) publishLiveInterpretation(ctx context.Context, tacTG
 		}
 	}
 
-	// On the first transmission that reports SAR notification, badge the parent alert with the
-	// green check. Gated on the false→true transition (via the pre-write read above) so we do
-	// exactly one extra chat.update per rescue, not one per subsequent transmission. SAR
-	// notification is monotonic — the mention stays in the cumulative transcript history — so
-	// once badged it stays badged.
-	if summary.SARNotified && !wasNotified {
-		tc.badgeParentAlertSAR(ctx, tacTGID, meta)
+	// Re-render the parent alert at most once per pass, and only when something visible on it
+	// changed: the SAR badge latching on (false→true) or the page-out brief changing. The
+	// re-render reads summary_data (written just above), so it carries both decorations.
+	sarFlipped := summary.SARNotified && !wasNotified
+	briefChanged := FormatBrief(summary) != prevBrief
+	switch {
+	case sarFlipped && briefChanged:
+		tc.refreshParentAlert(ctx, tacTGID, meta, "sar_notified+brief_changed")
+	case sarFlipped:
+		tc.refreshParentAlert(ctx, tacTGID, meta, "sar_notified")
+	case briefChanged:
+		tc.refreshParentAlert(ctx, tacTGID, meta, "brief_changed")
 	}
 
 	blocks := BuildLiveInterpretationBlocks(summary, time.Now().Local())
@@ -297,10 +304,10 @@ func (tc *TranscribeClient) publishLiveInterpretation(ctx context.Context, tacTG
 	}
 }
 
-// badgeParentAlertSAR re-renders the parent rescue alert with the green-check "Search &
-// Rescue notified" badge and chat.update's it in place. Called once per rescue on the
-// SAR-notified transition. Best-effort: any failure logs and returns — the live
-// interpretation message still carries the SAR badge regardless.
+// refreshParentAlert re-renders the parent rescue alert (SAR badge + page-out brief) and
+// chat.update's it in place. Called at most once per summary pass, when the SAR-notified
+// transition fires and/or the brief changed. Best-effort: any failure logs and returns — the
+// live interpretation message still carries the same information regardless.
 //
 // The current expiry is read from the active_tacs ZSET (score = unix expiry) so the live
 // "Expires …" line stays accurate — including after an Extend — without threading the expiry
@@ -311,11 +318,19 @@ func (tc *TranscribeClient) publishLiveInterpretation(ctx context.Context, tacTG
 // have spent ~120s in the LLM, and a dispatch correction landing in that window would otherwise
 // be rendered away — permanently, since corrections are one-shot. The passed meta is only a
 // fallback for a failed/missing read.
-func (tc *TranscribeClient) badgeParentAlertSAR(ctx context.Context, tgid string, meta ClosureMeta) {
+func (tc *TranscribeClient) refreshParentAlert(ctx context.Context, tgid string, meta ClosureMeta, reason string) {
 	meta = tc.freshClosureMeta(ctx, tgid, meta)
-	if tc.rerenderParentAlert(ctx, meta, true, fmt.Sprintf("%s — Search & Rescue notified", meta.TACChannel)) {
-		slog.Info("live interpretation: badged parent alert — SAR notified",
-			slog.String("tgid", tgid), slog.String("tac", meta.TACChannel))
+	fallback := fmt.Sprintf("%s — rescue alert updated", meta.TACChannel)
+	if s, ok := tc.readSummaryData(ctx, tgid); ok {
+		if brief := FormatBrief(s); brief != "" {
+			fallback = fmt.Sprintf("%s — %s", meta.TACChannel, brief)
+		} else if s.SARNotified {
+			fallback = fmt.Sprintf("%s — Search & Rescue notified", meta.TACChannel)
+		}
+	}
+	if tc.rerenderParentAlert(ctx, meta, fallback) {
+		slog.Info("live interpretation: refreshed parent alert",
+			slog.String("tgid", tgid), slog.String("tac", meta.TACChannel), slog.String("reason", reason))
 	}
 }
 

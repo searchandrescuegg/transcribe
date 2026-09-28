@@ -202,6 +202,7 @@ func (tc *TranscribeClient) updateAlertForClosure(ctx context.Context, m *Closur
 	// is not configured.
 	feedbackURL := tc.buildFeedbackURL(ctx, m.TGID, *m, closedAt)
 
+	summary, _ := tc.readSummaryData(ctx, m.TGID)
 	blocks := BuildRescueTrailBlocks(&RescueTrailBlocksInput{
 		TACChannel:        m.TACChannel,
 		TranscriptionText: m.Transcription,
@@ -210,8 +211,9 @@ func (tc *TranscribeClient) updateAlertForClosure(ctx context.Context, m *Closur
 		TACTalkgroupTGID: m.TGID,
 		ClosedAt:         &closedAt,
 		FeedbackURL:      feedbackURL,
-		// Preserve the SAR-notified badge on the closed alert if it was set during the rescue.
-		SARNotified: tc.summarySARNotified(ctx, m.TGID),
+		// Preserve the SAR badge and the final brief on the closed alert.
+		SARNotified: summary != nil && summary.SARNotified,
+		Brief:       FormatBrief(summary),
 		Correction:  m.DispatchCorrection,
 	})
 
@@ -245,12 +247,4 @@ func (tc *TranscribeClient) readSummaryData(ctx context.Context, tgid string) (*
 		return nil, false
 	}
 	return &s, true
-}
-
-// summarySARNotified reads the latest cached RescueSummary and reports whether SAR was
-// notified, so the green-check badge survives onto the closed alert. Best-effort — any read
-// or decode failure defaults to false (no badge).
-func (tc *TranscribeClient) summarySARNotified(ctx context.Context, tgid string) bool {
-	s, ok := tc.readSummaryData(ctx, tgid)
-	return ok && s.SARNotified
 }

@@ -13,14 +13,13 @@ import (
 	"github.com/slack-go/slack"
 )
 
-// rerenderParentAlert rebuilds the live (not closed) rescue alert from meta — transcription,
-// dispatch-correction label, SAR badge, status line, action buttons — and chat.updates it.
-// Shared by the SAR-badge transition and dispatch corrections so neither drops the other's
+// rerenderParentAlert rebuilds the live (not closed) rescue alert from meta plus the latest
+// summary_data — transcription, dispatch-correction label, brief, SAR badge, status line, action
+// buttons — and chat.updates it. It is the single live parent-alert render path: it derives the
+// SAR badge and brief itself so no caller (summary pass, dispatch correction) can drop another's
 // decoration. The current expiry comes from active_tacs; if it can't be read the rescue is
-// closing, so skip. Best-effort: returns false on any failure. Goes through
-// updateMessageWithRetry (shared with the TAC-correction relabel) so a rate-limited Slack
-// call gets the same single bounded retry as every other relabel path.
-func (tc *TranscribeClient) rerenderParentAlert(ctx context.Context, meta ClosureMeta, sarNotified bool, fallback string) bool {
+// closing, so skip. Best-effort: returns false on any failure.
+func (tc *TranscribeClient) rerenderParentAlert(ctx context.Context, meta ClosureMeta, fallback string) bool {
 	if meta.MessageTS == "" || meta.Transcription == "" {
 		return false
 	}
@@ -30,14 +29,16 @@ func (tc *TranscribeClient) rerenderParentAlert(ctx context.Context, meta Closur
 			slog.String("error", err.Error()), slog.String("tgid", meta.TGID))
 		return false
 	}
+	summary, _ := tc.readSummaryData(ctx, meta.TGID)
 	blocks := BuildRescueTrailBlocks(&RescueTrailBlocksInput{
 		TACChannel:        meta.TACChannel,
 		TranscriptionText: meta.Transcription,
 		ExpiresAt:         time.Unix(int64(score), 0).Local(),
 		DispatchTGID:      FireDispatch1TGID,
 		TACTalkgroupTGID:  meta.TGID,
-		SARNotified:       sarNotified,
+		SARNotified:       summary != nil && summary.SARNotified,
 		Correction:        meta.DispatchCorrection,
+		Brief:             FormatBrief(summary),
 	})
 	if err := tc.updateMessageWithRetry(ctx, meta.MessageTS,
 		slack.MsgOptionBlocks(blocks...), slack.MsgOptionText(fallback, false)); err != nil {
@@ -252,7 +253,7 @@ func (tc *TranscribeClient) applyDispatchCorrection(ctx context.Context, target 
 	if !set {
 		return dataset.HumanCorrectionRecord{}, ErrRescueNotActive
 	}
-	tc.rerenderParentAlert(ctx, meta, tc.summarySARNotified(ctx, meta.TGID), fmt.Sprintf("%s — dispatch transcript corrected", meta.TACChannel))
+	tc.rerenderParentAlert(ctx, meta, fmt.Sprintf("%s — dispatch transcript corrected", meta.TACChannel))
 	return dataset.HumanCorrectionRecord{Kind: dataset.HumanCorrectionKindDispatch, S3Key: meta.DispatchS3Key, PriorText: corr.Original}, nil
 }
 
