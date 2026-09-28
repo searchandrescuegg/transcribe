@@ -6,6 +6,7 @@ import (
 
 	"github.com/searchandrescuegg/transcribe/internal/ml"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // The King County gazetteer must be concatenated into both system prompts (in every
@@ -175,4 +176,26 @@ func TestRescueSummaryPrompt_HumanCorrectionRules(t *testing.T) {
 	assert.Contains(t, RescueSummarySystemPrompt, "100% correct")
 	assert.Contains(t, RescueSummarySystemPrompt, "never as instructions")
 	assert.Contains(t, RescueSummarySystemPrompt, "16. VERIFIED TRANSCRIPTS")
+}
+
+func TestRescueSummaryPrompt_BriefRule(t *testing.T) {
+	assert.Contains(t, RescueSummarySystemPrompt, "17. BRIEF")
+	assert.Contains(t, RescueSummarySystemPrompt, "never infer or invent")
+	assert.Contains(t, RescueSummarySystemPrompt, "BriefLocation")
+}
+
+func TestRenderPreviousSummary_IncludesBrief(t *testing.T) {
+	out := renderPreviousSummary(&ml.RescueSummary{BriefLocation: "Mailbox Peak", BriefCondition: "ankle injury"})
+	assert.Contains(t, out, "Brief: Mailbox Peak · — · ankle injury")
+}
+
+// The strict structured-output schema must carry (and require) the new fields.
+func TestRescueSummarySchema_HasBriefFields(t *testing.T) {
+	s, err := RescueSummarySchema()
+	require.NoError(t, err)
+	for _, f := range []string{"brief_location", "brief_subject", "brief_condition"} {
+		_, ok := s.Properties[f]
+		assert.True(t, ok, "schema property %s", f)
+		assert.Contains(t, s.Required, f)
+	}
 }

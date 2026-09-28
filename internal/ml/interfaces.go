@@ -114,6 +114,12 @@ type RescueSummary struct {
 	// en route", "False alarm", "Ongoing", etc. The model picks from observed cues.
 	Outcome string `json:"outcome"`
 
+	// Brief* are the page-out-style slots rendered as one bold line on the parent alert
+	// ("Mailbox Peak · 54F · ankle injury"). Each is a few words; empty when not stated.
+	BriefLocation  string `json:"brief_location"`
+	BriefSubject   string `json:"brief_subject"`
+	BriefCondition string `json:"brief_condition"`
+
 	// SARNotified is true when the TAC chatter clearly indicates Search and Rescue has been
 	// notified / requested / contacted / is responding (phrasing varies widely). Surfaced as a
 	// green-check badge on the alert and in the live interpretation. Latched on the alert: once
