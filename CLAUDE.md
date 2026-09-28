@@ -46,7 +46,8 @@ button opens a Google Form prefilled with incident context.
 | Shared prompt + schema contract in `internal/prompts` | Single source of truth so the two backends can't drift on wording or output shape | `internal/prompts/prompts.go`, `internal/prompts/schema.go` |
 | Anthropic backend uses native structured outputs (`output_config.format`) with thinking disabled | GA structured-output path; thinking off keeps short extraction/classification calls fast and bounded to `WorkerTimeout` | `internal/anthropic/anthropic.go` |
 | Optional Postgres dataset capture: async best-effort decorator + direct writes | Compile a transcription + LLM-I/O corpus for prompt refinement without ever blocking the pipeline (drops on full buffer, never errors upward) | `internal/dataset/`, `internal/transcribe/transcribe.go` (processRecord), `cmd/transcribe/main.go` |
-| SAR-notified green-check badge, latched via the `summary_data` false→true transition | Surfaces "Search & Rescue notified" on the parent alert + live interpretation; fires exactly one extra `chat.update` per rescue and adds **no** new sidecar key (transition detected by reading `summary_data` before overwrite; expiry for the mid-rescue re-render read from `active_tacs` via `ZScore`) | `internal/prompts` (rule #10), `live_interpretation.go` (`badgeParentAlertSAR`), `slack.go` (`buildSARNotifiedBlock`), `sweeper.go` (`summarySARNotified`, closed-alert badge) |
+| SAR-notified green-check badge, latched via the `summary_data` false→true transition | Surfaces "Search & Rescue notified" on the parent alert + live interpretation; fires exactly one extra `chat.update` per rescue and adds **no** new sidecar key (transition detected by reading `summary_data` before overwrite; expiry for the mid-rescue re-render read from `active_tacs` via `ZScore`) | `internal/prompts` (rule #10), `live_interpretation.go` (`refreshParentAlert`), `corrections.go` (`rerenderParentAlert`), `slack.go` (`buildSARNotifiedBlock`), `sweeper.go` (closed-alert badge) |
+| Page-out brief on the parent alert, from the live summary | "Location · subject · condition" under the header so people see the situation at a glance; three `brief_*` slots on `RescueSummary` (prompt rule 17), formatted by `FormatBrief`. No brief until the first summary pass. `rerenderParentAlert` derives SAR badge + brief from `summary_data`, and `publishLiveInterpretation` re-renders only when the brief changes or SAR flips — at most one `chat.update` per pass, no new keys | `internal/prompts` (rule 17), `slack.go` (`FormatBrief`, `buildBriefBlock`), `live_interpretation.go` (`refreshParentAlert`), `corrections.go` (`rerenderParentAlert`), `sweeper.go` (closed-alert brief) |
 | Additive live-interpretation summary: prev summary fed back as input | Stops key-event churn — the model EXTENDS its prior summary (preserve established KeyEvents, append new) instead of re-deriving from scratch each transmission. Prev summary read from the existing `summary_data` (no new key); missing/garbled prior degrades to the old full-rewrite behavior | `internal/prompts` (summary rule #12 + `renderPreviousSummary`), `ml.RescueSummaryInput.PreviousSummary`, `live_interpretation.go` (`runOneSummaryPass` reads `readSummaryData`) |
 | Per-transmission LLM cleanup of TAC traffic | Raw ASR TAC transmissions were posted verbatim; a dedicated (cheap-model) cleanup call fixes ASR errors, place names (gazetteer), and unit callsigns before the thread reply AND the summary. Best-effort with raw fallback; kill-switch `TAC_CLEANUP_ENABLED` | `internal/ml` (`TranscriptCleaner`), `internal/prompts` (`TACCleanupSystemPrompt`), both backends' `CleanTACTranscript`, `process.go` (`maybeCleanTranscript`) |
 | CAD (PulsePoint) unit enrichment behind an optional resolver | Feeds the units actually assigned to the call into cleanup + summary so garbled callsigns snap to real units. Fuzzy correlation (location + call-type + recency) with agency-roster fallback; entirely best-effort and flag-gated (`PULPO_ENABLED`). Cached per-rescue in `pulpo_units:<TGID>` | `internal/pulsepoint/` (Resolver, `selectUnitContext`, `UnitContext.PromptBlock`), `transcribe.UnitResolver`, `unit_context.go` (`unitContextFor`) |
@@ -145,6 +146,12 @@ Each was discovered (and fixed) during development; comments in code reference t
 15. **Switch TAC must carry `Transcription`/`DispatchCorrection`/`DispatchS3Key` and migrate
     operator notes before deleting old sidecars** — radio entries still reset per #6, but
     human-verified notes describe the same incident. (`slackctl/switch_tac.go`)
+
+16. **`rerenderParentAlert` is the single live parent-alert render path and derives its
+    decorations from `summary_data`** — the SAR badge and the brief are read inside it, never
+    passed by callers. Otherwise a caller that only knows one decoration (e.g. a dispatch
+    correction) re-renders the alert without the other and silently wipes it.
+    (`corrections.go` `rerenderParentAlert`)
 
 ---
 
@@ -402,3 +409,6 @@ structured-output JSON schema is generated from the struct via
 but BLOCK BUILDER and FEEDBACK URL code that reads those fields needs hand-updating.
 Search for the field name across `internal/transcribe/slack.go` and
 `internal/transcribe/feedback.go`.
+
+The `Brief*` fields (rule 17) feed the one-line brief on the parent alert via `FormatBrief`;
+changing their meaning changes what responders see first.
