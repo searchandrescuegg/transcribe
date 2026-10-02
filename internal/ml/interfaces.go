@@ -30,7 +30,7 @@ type TACTranscript struct {
 }
 
 // OperatorCorrection is free-form, human-verified context posted by incident leadership as a
-// `correction:` thread reply. The summarizer treats it as authoritative over any transcript.
+// `@PSERN` thread reply. The summarizer treats it as authoritative over any transcript.
 type OperatorCorrection struct {
 	At   string `json:"at"` // HH:MM:SS the Slack message was posted
 	Text string `json:"text"`

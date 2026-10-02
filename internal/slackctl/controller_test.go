@@ -90,7 +90,8 @@ func (s *SlackctlSuite) SetupTest() {
 	// Bypass slackctl.New (which requires SlackAppToken) and construct the controller
 	// directly with just the dependencies the state-mutation methods need.
 	s.controller = &Controller{
-		dfly: dfly,
+		dfly:      dfly,
+		botUserID: testBotID,
 		cfg: &config.Config{
 			TacticalChannelActivationDuration: 30 * time.Minute,
 			WorkerTimeout:                     5 * time.Second,

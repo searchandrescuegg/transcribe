@@ -96,7 +96,7 @@ func (c *Controller) SwitchTAC(ctx context.Context, oldTGID, newTGID string) (ne
 		return transcribe.ClosureMeta{}, time.Time{}, false, fmt.Errorf("ZRem old closure: %w", err)
 	}
 
-	// Human-verified `correction:` notes describe the same incident; carry them to the new TGID
+	// Human-verified `@PSERN` operator notes describe the same incident; carry them to the new TGID
 	// before the old list is deleted. Best-effort: a failure logs but never blocks the switch.
 	if c.corrections != nil {
 		if err := c.corrections.MigrateOperatorCorrections(ctx, oldTGID, newTGID); err != nil {

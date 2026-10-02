@@ -250,13 +250,16 @@ actions row.
    - **Correct transcript** — ⋯ menu → *Correct transcript* on the dispatch alert or any radio
      transmission post. One correction per message; the post is relabelled
      "✏️ Corrected by @you". The live interpretation is regenerated from the corrected text.
-   - **`correction:` replies** — a thread reply starting with `correction:` is treated as 100%
-     correct context by the live interpretation (✅ = applied). Editing or deleting the reply
-     updates/retracts it. Replies without the prefix are ignored.
+   - **`@PSERN` replies** — a thread reply that *starts* with a mention of the bot
+     (e.g. `@PSERN patient is 54F, not 5F`) is treated as 100% correct context by the live
+     interpretation (✅ = applied). Editing or deleting the reply updates/retracts it; editing
+     the leading mention away retracts it. Mid-sentence mentions and replies without the
+     mention are ignored. (The bot's user ID is looked up via `auth.test` at startup, so
+     renaming the bot doesn't break this.)
    Updating an existing app to this manifest adds scopes — reinstall and compare the Bot User
    OAuth Token with `SLACK_TOKEN`, updating it if Slack issued a new one. This feature also
    requires the bot to be a **member of the alert channel** (`/invite @transcribe`) — it needs
-   `message` events from that channel to see `correction:` replies, and `chat:write.public`
+   `message` events from that channel to see `@PSERN` replies, and `chat:write.public`
    alone does not deliver those events.
 7. **Audio attachments** — each transcription's WAV is posted as a reply right under its post
    (TAC transmissions, the dispatch alert, re-pages) so you can listen when the transcript looks

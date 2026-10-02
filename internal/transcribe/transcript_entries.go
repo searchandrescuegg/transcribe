@@ -28,7 +28,7 @@ type TranscriptCorrection struct {
 }
 
 // liveTranscriptEntry is one element of tac_transcripts:<TGID>: either a radio transmission
-// (kind radio) or a human `correction:` thread message (kind operator). All fields beyond
+// (kind radio) or a human `@PSERN` operator-note thread message (kind operator). All fields beyond
 // captured_at/text are optional so pre-feature entries decode unchanged. Raw ASR is NOT
 // stored here — it is joinable in the dataset via s3_key.
 type liveTranscriptEntry struct {
