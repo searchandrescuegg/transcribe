@@ -54,7 +54,7 @@ button opens a Google Form prefilled with incident context.
 | Same-incident dispatch dedup keyed on active `tac_meta:<TGID>` | A TAC is one incident at a time, so a 2nd tone-out naming an already-active TAC is an additional unit, not a new rescue. `processDispatchCall` checks `readClosureMeta` before posting; if active it refreshes the window + posts a thread reply instead of a 2nd alert — which would overwrite `tg:<TGID>` and orphan the original thread. (Residual: near-simultaneous first tone-outs can still double-post; the "different times" case is covered.) | `process.go` (`handleAdditionalDispatch`), `slack.go` (`BuildAdditionalDispatchBlocks`) |
 | Delete button targets the clicked message, not `tac_meta.MessageTS` | Orphaned duplicates share a TGID with the live alert, so a TGID-keyed delete would nuke the live one. `rescue_delete` deletes `payload.Container.MessageTs` and only tears down state when that ts IS the live alert. | `slackctl/delete.go` |
 | Trail-rescue detection has a transcription safety net, not just the LLM call_type | The LLM classifier can mislabel a trail rescue as another rescue subtype (prod 2026-07-15: "Rescue Trail Tac 2" → "Rescue - General" → **no alert**). A missed trail rescue is the worst failure mode, so `selectTrailRescueMessage` salvages any dispatch whose RAW transcription says "rescue trail"/"trail rescue" (adjacent phrase — narrow to avoid false positives), taking the TAC from the parsed message or a regex on the text. Prompt also nudges toward the trail-rescue value. | `rules.go` (`transcriptionSignalsTrailRescue`, `tacChannelFromText`), `process.go` (`selectTrailRescueMessage`), `prompts.go` |
-| Human corrections: one-shot transcript edits (message shortcut) + `correction:` thread notes, stored in existing `tac_transcripts` entries / `tac_meta` | Humans fix ASR errors and add verified context the summary treats as authoritative, with no new per-TGID sidecar keys. transcribe owns state; slackctl is an adapter via `CorrectionService`. Edits/retractions force a full-rewrite pass (`summary_stale="rewrite"`) so superseded facts don't linger. Dispatch corrections write `tac_meta` with `SetXX` (SET XX KEEPTTL) rather than `Set`, so a rescue that closed mid-correction can't be resurrected — see invariant #12 | `internal/transcribe/corrections.go`, `operator_corrections.go`, `transcript_entries.go`, `internal/slackctl/correct_transcript.go`, `operator_corrections.go` |
+| Human corrections: one-shot transcript edits (message shortcut) + `@PSERN` thread notes (reply that starts with a mention of the bot; bot user ID from `auth.test` at controller start), stored in existing `tac_transcripts` entries / `tac_meta` | Humans fix ASR errors and add verified context the summary treats as authoritative, with no new per-TGID sidecar keys. transcribe owns state; slackctl is an adapter via `CorrectionService`. Edits/retractions force a full-rewrite pass (`summary_stale="rewrite"`) so superseded facts don't linger. Dispatch corrections write `tac_meta` with `SetXX` (SET XX KEEPTTL) rather than `Set`, so a rescue that closed mid-correction can't be resurrected — see invariant #12 | `internal/transcribe/corrections.go`, `operator_corrections.go`, `transcript_entries.go`, `internal/slackctl/correct_transcript.go`, `operator_corrections.go` |
 | Transcription audio as a threaded file reply | Responders can listen when the ASR is garbled. The transcript post is unchanged (correction targeting keys on its ts); the WAV is uploaded as a separate reply right after it via `UploadFileV2Context`, using bytes `processRecord` already fetched for ASR. Best-effort (never fails/nacks the record), flag `AUDIO_ATTACHMENTS_ENABLED`, `files:write` scope. Dispatch-alert audio uploads only after the rescue is fully registered (allow-list, routing, closure, CAD warm-up); TAC path is post → store entry in `tac_transcripts` → upload → summary, so a slow upload can't lose the transmission. Upload skipped when < `audioDeadlineReserve` (10s) of worker budget remains (invariant #7) | `internal/transcribe/audio.go` (`attachAudio`), `process.go` (call sites) |
 
 ---
@@ -201,7 +201,7 @@ Five buttons + one URL button on every rescue alert (when `SLACK_APP_TOKEN` is c
 | `rescue_delete` | Button (danger) + confirm | Yes (allowlist) | chat.delete **the specific clicked message** (`payload.Container.MessageTs`). Smart: if that ts == `tac_meta.MessageTS` it's the live alert → tear the incident down via `CancelTAC` (no tombstone) then delete; otherwise it's an orphan → delete the message only, live incident untouched. (`slackctl/delete.go`) |
 | `feedback_form` | URL button (closed alert only) | n/a | Opens Google Form client-side; controller no-ops the resulting `block_actions` event |
 | `correct_transcript` | Message shortcut → modal | Yes (allowlist) | One-shot correction of a dispatch alert or TAC post; relabels the post and re-summarizes (rewrite) |
-| `correction:` thread reply | Events API `message` | Yes (allowlist; others silently ignored) | Stored as an authoritative operator note; ✅ reaction; edit/delete updates/retracts |
+| `@PSERN` thread reply (leading mention of the bot) | Events API `message` | Yes (allowlist; others silently ignored) | Stored as an authoritative operator note; ✅ reaction; edit/delete updates/retracts (editing the leading mention away retracts). Mid-sentence mentions are ignored. Disabled (ERROR log) if `auth.test` fails at startup |
 
 Authorization: `SLACK_ALLOWED_USER_IDS` (comma-separated user IDs). Empty = deny all.
 Contains `*` = allow all (logged at WARN). The unauthorized ephemeral message
@@ -310,14 +310,14 @@ read TGID from the button's `value` field instead.
 | `internal/transcribe/parse.go` | `parseKey` — Trunk-Recorder filename parser |
 | `internal/transcribe/transcript_entries.go` | `liveTranscriptEntry` (radio/operator), `readEntries`/`findEntryBySlackTS`/`setEntry`/`appendEntry` — the `tac_transcripts:<TGID>` list schema |
 | `internal/transcribe/corrections.go` | `ApplyTranscriptCorrection`, `ResolveCorrectionTarget`, `LookupTGIDByThread`, `rerenderParentAlert`; one-shot guard + `SetXX`-guarded dispatch correction |
-| `internal/transcribe/operator_corrections.go` | `UpsertOperatorCorrection`, `RemoveOperatorCorrection`, `MigrateOperatorCorrections` — `correction:` thread notes |
+| `internal/transcribe/operator_corrections.go` | `UpsertOperatorCorrection`, `RemoveOperatorCorrection`, `MigrateOperatorCorrections` — `@PSERN` operator notes |
 | `internal/slackctl/controller.go` | Socket Mode event loop, dispatch, authorization |
 | `internal/slackctl/cancel.go` | `CancelTAC` state mutations + `handleCancel` Slack-side wiring |
 | `internal/slackctl/extend.go` | `ExtendTAC` + `handleExtend` |
 | `internal/slackctl/switch_tac.go` | `SwitchTAC` + `handleSwitchTAC`; `parseOldTGIDFromBlockID` |
 | `internal/slackctl/corrections.go` | `CorrectionService` interface (adapter to `internal/transcribe`), `correctionErrorMessage` |
 | `internal/slackctl/correct_transcript.go` | `correct_transcript` message shortcut + modal: `handleCorrectShortcut`, `handleCorrectionSubmission` |
-| `internal/slackctl/operator_corrections.go` | Events API `message` routing for `correction:` thread replies: `dispatchEvent`, `parseCorrectionEvent`, `slack_event:<id>` dedup |
+| `internal/slackctl/operator_corrections.go` | Events API `message` routing for `@PSERN` operator-note replies: `extractCorrection` (leading `<@BOTID>`), `dispatchEvent`, `parseCorrectionEvent`, `slack_event:<id>` dedup |
 | `internal/prompts/prompts.go` | Shared prompt text + system/user prompt builders for both ML backends |
 | `internal/prompts/schema.go` | Shared response-schema builders (`DispatchSchema` with enum injection, `RescueSummarySchema`) |
 | `internal/openai/openai.go` | `OpenAIClient` (OpenAI-compatible) implementing both `DispatchMessageParser` and `RescueSummarizer`; delegates prompts/schema to `internal/prompts` |
@@ -345,7 +345,7 @@ read TGID from the button's `value` field instead.
   `go test ./<pkg>/...`.
 - **Integration tests** in `integration_test.go` (transcribe pkg) and `controller_test.go` +
   `operator_corrections_integration_test.go` (slackctl pkg — dispatch/dedup/outcome-branching
-  for `correction:` thread events). Use `testify/suite` for shared container lifecycle.
+  for `@PSERN` operator-note events). Use `testify/suite` for shared container lifecycle.
 - **Containers**: Dragonfly + Pulsar via `testcontainers-go`. Suite-scoped (started in
   `SetupSuite`, terminated in `TearDownSuite`). State reset per-test via `SetupTest` →
   `FlushDB`.

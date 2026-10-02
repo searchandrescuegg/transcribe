@@ -16,7 +16,7 @@ import (
 // — no summary refresh, no reaction.
 var ErrOperatorCorrectionUnchanged = errors.New("operator correction unchanged")
 
-// UpsertOperatorCorrection stores (or, for an already-seen slackTS, amends) a `correction:`
+// UpsertOperatorCorrection stores (or, for an already-seen slackTS, amends) an `@PSERN`
 // thread note on the active rescue whose thread is threadTS. Returns created=true for a new
 // note. The caller refreshes the summary with rewrite = !created: a new note is additive
 // (rule 15 overrides conflicts), an edit may retract facts so it re-derives. An edit whose text
@@ -61,7 +61,7 @@ func (tc *TranscribeClient) UpsertOperatorCorrection(ctx context.Context, thread
 }
 
 // RemoveOperatorCorrection tombstones the note posted as slackTS (Slack message deleted, or
-// edited so it no longer starts with `correction:`). removed=false when there was nothing live
+// edited so it no longer starts with a mention of the bot). removed=false when there was nothing live
 // to remove. The caller refreshes with rewrite=true when removed.
 func (tc *TranscribeClient) RemoveOperatorCorrection(ctx context.Context, threadTS, slackTS, userID string) (string, bool, error) {
 	tgid, _, ok, err := tc.LookupTGIDByThread(ctx, threadTS)

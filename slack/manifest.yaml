@@ -85,13 +85,13 @@ oauth_config:
       - chat:write.public
       # commands — required for the "Correct transcript" message shortcut.
       - commands
-      # channels:history / groups:history — receive `message` events so `correction:` thread
+      # channels:history / groups:history — receive `message` events so `@PSERN` thread
       # replies from incident leadership can feed the live interpretation. Every other message is
       # ignored. Public (channels:*) and private (groups:*) scopes/events are both listed below;
       # drop whichever channel type your alert channel isn't.
       - channels:history
       - groups:history
-      # reactions:write — ✅ / ⚠️ on a `correction:` reply to show whether it was applied.
+      # reactions:write — ✅ / ⚠️ on an `@PSERN` operator-note reply to show whether it was applied.
       - reactions:write
       # files:write — upload each transcription's audio (WAV) as a reply in the rescue thread so
       # responders can listen to what the ASR heard. Gated by AUDIO_ATTACHMENTS_ENABLED.
@@ -114,8 +114,9 @@ settings:
     # points at a public endpoint backed by the service.
     is_enabled: true
   event_subscriptions:
-    # `message` events power `correction:` thread replies. Only allowlisted users' replies in
-    # the alert channel that start with "correction:" are used; everything else is ignored.
+    # `message` events power `@PSERN` operator-note thread replies. Only allowlisted users'
+    # replies in the alert channel that START with a mention of the bot are used; everything
+    # else is ignored.
     # Public (message.channels) and private (message.groups) are both listed; drop whichever
     # channel type your alert channel isn't. The bot must be a member of the alert channel
     # (/invite @transcribe) to receive these events at all.

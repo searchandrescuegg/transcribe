@@ -76,7 +76,7 @@ func (s *SlackctlSuite) TestDispatchEvent_DedupsBySlackEventID() {
 	fake := &fakeCorrections{upsertTGID: "1389", upsertCreated: false}
 	s.controller.corrections = fake
 
-	evt := buildCorrectionSocketEvent(ch, "Ev1", "U_LEAD", "correction: fixed ankle", "200.100", "100.000")
+	evt := buildCorrectionSocketEvent(ch, "Ev1", "U_LEAD", "<@UBOT> fixed ankle", "200.100", "100.000")
 
 	// dispatchEvent runs its actual work in a goroutine (see operator_corrections.go), so both
 	// calls return immediately — the redelivery must be caught by the SETNX dedup guard, not
@@ -106,7 +106,7 @@ func (s *SlackctlSuite) TestDispatchEvent_UnauthorizedUser_ServiceNeverCalled() 
 	fake := &fakeCorrections{}
 	s.controller.corrections = fake
 
-	evt := buildCorrectionSocketEvent(ch, "Ev2", "U_RANDOM", "correction: fixed ankle", "200.100", "100.000")
+	evt := buildCorrectionSocketEvent(ch, "Ev2", "U_RANDOM", "<@UBOT> fixed ankle", "200.100", "100.000")
 
 	// The authorization check runs synchronously in dispatchEvent before any goroutine is
 	// spawned, so — unlike the dedup test — there is nothing async to wait out here.

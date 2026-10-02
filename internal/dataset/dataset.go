@@ -57,7 +57,7 @@ const (
 )
 
 // HumanCorrectionRecord is one human edit from Slack: a transcript correction or a
-// `correction:` thread note (create / edit / delete).
+// `@PSERN` operator note (create / edit / delete).
 type HumanCorrectionRecord struct {
 	Kind          string
 	Action        string

@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/searchandrescuegg/transcribe/internal/config"
 	"github.com/searchandrescuegg/transcribe/internal/dragonfly"
@@ -41,11 +42,14 @@ type Controller struct {
 	// off (lost audit-trail-as-authz, fat-finger surface area).
 	allowAny bool
 
-	// corrections drives human transcript corrections and `correction:` notes. Nil disables
+	// corrections drives human transcript corrections and @-mention operator notes. Nil disables
 	// them (tests that only exercise cancel/extend/switch construct the controller without it).
 	corrections CorrectionService
 
-	// correctionOpLocks serializes `correction:` note operations per Slack message (striped by
+	// botUserID is the bot's own Slack user ID (from auth.test at Run). Operator notes are thread
+	// replies that start with a mention of it ("@PSERN 54F not 5F"). Empty disables them.
+	botUserID string
+	// correctionOpLocks serializes operator-note operations per Slack message (striped by
 	// a hash of the message ts; see handleCorrectionOp). Zero value is ready to use.
 	correctionOpLocks [correctionOpLockStripes]sync.Mutex
 }
@@ -107,15 +111,35 @@ func New(cfg *config.Config, dfly *dragonfly.DragonflyClient, corrections Correc
 // Run blocks until ctx is cancelled, processing Slack interactivity events. Intended to
 // run as its own goroutine in the worker pool.
 func (c *Controller) Run(ctx context.Context) error {
+	c.botUserID = c.lookupBotUserID(ctx)
 	handler := socketmode.NewSocketmodeHandler(c.smClient)
 	handler.Handle(socketmode.EventTypeInteractive, c.dispatch)
-	// Events API: `message` events carry `correction:` thread replies (see operator_corrections.go).
+	// Events API: `message` events carry @-mention operator notes (see operator_corrections.go).
 	handler.Handle(socketmode.EventTypeEventsAPI, c.dispatchEvent)
 	slog.Info("slackctl: starting Socket Mode controller", slog.Int("authorized_users", len(c.allowed)))
 	if err := handler.RunEventLoopContext(ctx); err != nil {
 		return fmt.Errorf("socketmode event loop: %w", err)
 	}
 	return nil
+}
+
+// lookupBotUserID asks Slack who the bot is (auth.test, no extra scope) so operator notes can be
+// recognized by a leading mention of it. On failure, mention corrections are disabled (logged
+// loudly) rather than guessing — everything else in the controller still works.
+func (c *Controller) lookupBotUserID(ctx context.Context) string {
+	timeout := c.cfg.SlackTimeout
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	authCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	resp, err := c.slackClient.AuthTestContext(authCtx)
+	if err != nil || resp.UserID == "" {
+		slog.Error("slackctl: auth.test failed; @-mention operator corrections are disabled", slog.Any("error", err))
+		return ""
+	}
+	slog.Info("slackctl: operator corrections listen for bot mentions", slog.String("bot_user_id", resp.UserID), slog.String("bot_user", resp.User))
+	return resp.UserID
 }
 
 // dispatch fans block_actions and message shortcuts out to the typed handlers. The one

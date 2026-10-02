@@ -25,16 +25,23 @@ const (
 	slackEventDedupTTL    = 10 * time.Minute
 )
 
-// correctionPrefixRE matches the opt-in marker: `correction:` (any case), leading whitespace
-// allowed. Anything else in the thread — including jokes — is ignored.
-var correctionPrefixRE = regexp.MustCompile(`(?is)^\s*correction\s*:(.*)$`)
+// mentionCorrectionRE matches the opt-in marker: a message that STARTS with a mention of the bot
+// (Slack sends "<@U123>" or the legacy "<@U123|name>"), optionally followed by ":". Requiring the
+// mention up front keeps it deliberate — "lol @PSERN is wrong again" mid-sentence is chatter, not
+// a correction. Group 1 is the user ID, group 2 the correction text.
+var mentionCorrectionRE = regexp.MustCompile(`(?s)^\s*<@([A-Z0-9]+)(?:\|[^>]*)?>\s*:?(.*)$`)
 
-func stripCorrectionPrefix(text string) (string, bool) {
-	m := correctionPrefixRE.FindStringSubmatch(text)
-	if m == nil {
+// extractCorrection returns the correction text when text starts with a mention of botUserID.
+// An empty botUserID (auth.test failed at startup) disables mention corrections entirely.
+func extractCorrection(text, botUserID string) (string, bool) {
+	if botUserID == "" {
 		return "", false
 	}
-	body := strings.TrimSpace(m[1])
+	m := mentionCorrectionRE.FindStringSubmatch(text)
+	if m == nil || m[1] != botUserID {
+		return "", false
+	}
+	body := strings.TrimSpace(m[2])
 	return body, body != ""
 }
 
@@ -54,9 +61,9 @@ type correctionOp struct {
 }
 
 // parseCorrectionEvent turns a Slack `message` event into a correction operation, or false when
-// it isn't one: wrong channel, not a thread reply, from a bot, or no `correction:` prefix.
-// Edits that keep the prefix upsert; edits that drop it, and deletes, remove.
-func parseCorrectionEvent(ev *slackevents.MessageEvent, channelID string) (correctionOp, bool) {
+// it isn't one: wrong channel, not a thread reply, from a bot, or not starting with a mention of
+// the bot. Edits that keep the leading mention upsert; edits that drop it, and deletes, remove.
+func parseCorrectionEvent(ev *slackevents.MessageEvent, channelID, botUserID string) (correctionOp, bool) {
 	if ev == nil || ev.Channel != channelID || ev.BotID != "" {
 		return correctionOp{}, false
 	}
@@ -69,7 +76,7 @@ func parseCorrectionEvent(ev *slackevents.MessageEvent, channelID string) (corre
 		if !isThreadReply(m) {
 			return correctionOp{}, false
 		}
-		text, ok := stripCorrectionPrefix(m.Text)
+		text, ok := extractCorrection(m.Text, botUserID)
 		if !ok {
 			return correctionOp{}, false
 		}
@@ -79,11 +86,11 @@ func parseCorrectionEvent(ev *slackevents.MessageEvent, channelID string) (corre
 		if !isThreadReply(m) {
 			return correctionOp{}, false
 		}
-		if text, ok := stripCorrectionPrefix(m.Text); ok {
+		if text, ok := extractCorrection(m.Text, botUserID); ok {
 			return correctionOp{Kind: correctionOpUpsert, ThreadTS: m.ThreadTimestamp, MessageTS: m.Timestamp, UserID: m.User, Text: text}, true
 		}
 		if prev := ev.PreviousMessage; prev != nil {
-			if _, was := stripCorrectionPrefix(prev.Text); was {
+			if _, was := extractCorrection(prev.Text, botUserID); was {
 				return correctionOp{Kind: correctionOpRemove, ThreadTS: m.ThreadTimestamp, MessageTS: m.Timestamp, UserID: m.User}, true
 			}
 		}
@@ -93,7 +100,7 @@ func parseCorrectionEvent(ev *slackevents.MessageEvent, channelID string) (corre
 		if !isThreadReply(prev) {
 			return correctionOp{}, false
 		}
-		if _, was := stripCorrectionPrefix(prev.Text); !was {
+		if _, was := extractCorrection(prev.Text, botUserID); !was {
 			return correctionOp{}, false
 		}
 		ts := ev.DeletedTimeStamp
@@ -124,7 +131,7 @@ func (c *Controller) dispatchEvent(evt *socketmode.Event, client *socketmode.Cli
 	if !ok {
 		return
 	}
-	op, ok := parseCorrectionEvent(msgEv, c.cfg.SlackChannelID)
+	op, ok := parseCorrectionEvent(msgEv, c.cfg.SlackChannelID, c.botUserID)
 	if !ok || !c.isAuthorized(op.UserID) {
 		return
 	}
@@ -154,7 +161,7 @@ func (c *Controller) correctionOpLock(slackTS string) *sync.Mutex {
 	return &c.correctionOpLocks[h.Sum32()%correctionOpLockStripes]
 }
 
-// handleCorrectionOp applies one `correction:` note operation. The stripe lock is scoped
+// handleCorrectionOp applies one operator-note (leading @-mention) operation. The stripe lock is scoped
 // narrowly to the storage read-modify-write (Upsert/Remove) ONLY — that's the sole step where an
 // edit racing a delete for the same message could read the live entry, lose the race, and write
 // Deleted=false over the retraction (resurrecting it). react and RefreshLiveInterpretation run
